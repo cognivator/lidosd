@@ -1,0 +1,7 @@
+# /etc/sudoers.d/lidosd  (mode 440, root:wheel)
+# Lets llmserver or an Admin user arm / disarm the lid-close OSD without a password.
+# The "" entry means "no arguments allowed"; `disarm` is listed explicitly.
+# Do NOT allow bare `lidosd` with any arguments (that would expose `daemon`).
+#
+# Validate before installing:  sudo visudo -cf lidosd.sudoers
+%admin, llmserver ALL=(root) NOPASSWD: /usr/local/sbin/lidosd "", /usr/local/sbin/lidosd disarm
