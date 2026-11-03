@@ -35,7 +35,7 @@
 #     the process (SUDO_USER set) and so cannot be turned on by an unprivileged
 #     caller.
 #   * An unprivileged caller is re-executed through `sudo -n` on the FIXED path
-#     /usr/local/sbin/lidosd with canonical arguments (never $0 / caller input).
+#     /Library/PrivilegedHelperTools/lidosd with canonical arguments (never $0 / caller input).
 #     See lidosd.sudoers, which allows only `lidosd` and `lidosd disarm`.
 #     At most one argument is accepted, and it must be arm | disarm | status | daemon.
 #   * The state directory must be a real directory owned by root and not
@@ -46,7 +46,7 @@
 # the OSD then simply stays armed until the next observed close/reopen, or
 # `lidosd disarm`, or the app exits.
 #
-# Install as root-owned, mode 755, in a root-owned directory (/usr/local/sbin);
+# Install as root-owned, mode 755, in a root-owned directory (/Library/PrivilegedHelperTools);
 # install.sh checks this.
 
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -58,7 +58,7 @@ set -u
 # ---- lidosd.sudoers and install.sh (install.sh checks OWNER_USER).
 OWNER_USER=llmserver
 APP_NAME=AnythingLLM
-SELF=/usr/local/sbin/lidosd
+SELF=/Library/PrivilegedHelperTools/lidosd
 SUDO=/usr/bin/sudo
 PMSET=/usr/bin/pmset
 IOREG=/usr/sbin/ioreg
