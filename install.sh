@@ -1,16 +1,20 @@
 #!/bin/bash
 # install.sh - deploy the AnythingLLM keep-awake pieces from THIS folder.
 #
-#   sudo bash /Users/Shared/<reponame>/install.sh
+#   sudo bash /Users/Shared/<reponame>/install.sh --group NAME
+#
+# --group NAME (required): the group whose members may run lidosd and
+# lidosd disarm without a password (substituted into the sudoers rule). The
+# installer does not create the group or add members; it only warns.
 #
 # The source folder is located from this script's own path, so the repo name does
 # not matter. Safe to re-run: it stops the running pieces, redeploys, and starts
 # them again. (Stopping the lid daemon disarms an armed OSD.)
 #
 # Deployed:
-#   root       /usr/local/sbin/lidosd
+#   root       /Library/PrivilegedHelperTools/lidosd
 #              /Library/LaunchDaemons/com.llmserver.lidosd.plist   (loaded)
-#              /etc/sudoers.d/lidosd                               (validated)
+#              /etc/sudoers.d/lidosd                               (validated; grants group NAME)
 #   llmserver  ~/bin/anythingllm-caffeinate.sh
 #              ~/Library/LaunchAgents/com.llmserver.anythingllm-caffeinate.plist
 #              (loaded now if llmserver has a GUI session, else at next login)
@@ -27,7 +31,7 @@
 #     what was installed.
 #   * Files in OWNER_USER's home are written BY OWNER_USER (sudo -u), never by
 #     root, so a symlink planted there cannot redirect a root write.
-#   * Existing shared directories (e.g. /usr/local/sbin) are never chown'd or
+#   * Existing shared directories (e.g. /Library/PrivilegedHelperTools) are never chown'd or
 #     chmod'd; missing ones are created root:wheel 755.
 #
 # OWNER_USER is a constant below and must match lidosd, anythingllm-caffeinate.sh,
@@ -36,6 +40,7 @@
 # Test mode: INSTALL_TEST=1 plus DESTDIR (stage under a prefix) enables the
 # overrides DESTDIR, OWNER_USER, OWNER_HOME, ROOT_GROUP and LAUNCHCTL (unset
 # LAUNCHCTL = skip all launchctl calls). Without INSTALL_TEST=1 they are ignored.
+# --group is a command-line flag in both modes, never an environment variable.
 
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
@@ -44,6 +49,8 @@ set -eu
 
 DAEMON_LABEL=com.llmserver.lidosd
 AGENT_LABEL=com.llmserver.anythingllm-caffeinate
+HELPER_DIR=/Library/PrivilegedHelperTools
+SLEEP_GROUP=
 SUDO=/usr/bin/sudo
 
 if [ "${INSTALL_TEST:-}" = 1 ]; then
@@ -70,6 +77,38 @@ CHAIN_TOP=/
 say()  { echo "==> $*"; }
 warn() { echo "WARNING: $*" >&2; }
 die()  { echo "install.sh: $*" >&2; exit 1; }
+
+usage() {
+    echo "usage: sudo bash $0 --group NAME" >&2
+    echo "  NAME: an existing group whose members may run lidosd without a password" >&2
+    echo "        (1-32 characters: a-z, 0-9, _ and -; not starting with a digit or -)" >&2
+    exit 2
+}
+
+# Parse and validate the command line. Runs before the sudo re-exec, so a missing
+# or bad --group fails without a password prompt.
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --group)
+                [ $# -ge 2 ] || { echo "install.sh: --group needs a value" >&2; usage; }
+                SLEEP_GROUP=$2
+                shift 2 ;;
+            --group=*)
+                SLEEP_GROUP=${1#--group=}
+                shift ;;
+            *)
+                echo "install.sh: unknown argument: $1" >&2
+                usage ;;
+        esac
+    done
+    [ -n "$SLEEP_GROUP" ] || { echo "install.sh: --group NAME is required" >&2; usage; }
+    case "$SLEEP_GROUP" in
+        [!abcdefghijklmnopqrstuvwxyz_]*|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+            die "invalid group name '$SLEEP_GROUP': use a-z, 0-9, _ and - only, starting with a letter or _" ;;
+    esac
+    [ "${#SLEEP_GROUP}" -le 32 ] || die "group name '$SLEEP_GROUP' is longer than 32 characters"
+}
 
 # ---------------------------------------------------------------- helpers
 lctl() { if [ -n "$LAUNCHCTL" ]; then "$LAUNCHCTL" "$@"; else return 0; fi; }
@@ -146,11 +185,33 @@ wait_unloaded() {   # wait_unloaded SERVICE-TARGET : wait (max ~10s) until launc
     done
 }
 
+# Action items, not errors (D1): the installer neither creates the group nor adds members.
+group_warnings() {
+    local gid
+    if ! dscl . -read "/Groups/$SLEEP_GROUP" >/dev/null 2>&1; then
+        warn "group '$SLEEP_GROUP' does not exist, so the sudoers rule grants nobody anything yet. Create it: sudo dseditgroup -o create $SLEEP_GROUP"
+        return 0
+    fi
+    if ! dseditgroup -o checkmember -m "$OWNER_USER" "$SLEEP_GROUP" >/dev/null 2>&1; then
+        warn "$OWNER_USER is not a member of '$SLEEP_GROUP'. Add: sudo dseditgroup -o edit -a $OWNER_USER -t user $SLEEP_GROUP"
+    fi
+    gid=$(dscl . -read "/Groups/$SLEEP_GROUP" PrimaryGroupID 2>/dev/null | sed -n 's/^PrimaryGroupID:[[:space:]]*//p')
+    case "$gid" in
+        ''|*[!0-9]*) warn "could not read the GID of group '$SLEEP_GROUP'" ;;
+        *) if [ "$gid" -lt 500 ]; then
+               warn "group '$SLEEP_GROUP' has GID $gid (below 500), a standard macOS group; a dedicated group is recommended for this rule"
+           fi ;;
+    esac
+    return 0
+}
+
 cleanup() { if [ -n "$STAGE" ]; then rm -rf "$STAGE"; fi; }
 
 # ---------------------------------------------------------------- main
 main() {
     local f d files
+
+    parse_args "$@"
 
     [ "$(id -u)" -eq 0 ] || exec "$SUDO" /bin/bash "$0" "$@"
 
@@ -171,7 +232,7 @@ main() {
     case "$OWNER_HOME" in /?*) ;; *) die "cannot determine home directory of $OWNER_USER" ;; esac
     [ -d "$DESTDIR$OWNER_HOME" ] || die "home directory $DESTDIR$OWNER_HOME of $OWNER_USER does not exist"
 
-    SBIN=$DESTDIR/usr/local/sbin
+    SBIN=$DESTDIR$HELPER_DIR
     DAEMONS=$DESTDIR/Library/LaunchDaemons
     SUDOERS_D=$DESTDIR/etc/sudoers.d
     AGENT_DIR=$DESTDIR$OWNER_HOME/Library/LaunchAgents
@@ -199,6 +260,16 @@ main() {
     trap cleanup EXIT
     chmod 700 "$STAGE"
     for f in $files; do cp "$SRC/$f" "$STAGE/$f"; done
+
+    # lidosd.sudoers is a template; substitute the validated group name into the STAGED copy
+    grep -Fq '@@SLEEP_GROUP@@' "$STAGE/lidosd.sudoers" \
+        || die "lidosd.sudoers has no @@SLEEP_GROUP@@ placeholder (is the template intact?)"
+    sed "s/@@SLEEP_GROUP@@/$SLEEP_GROUP/g" "$STAGE/lidosd.sudoers" > "$STAGE/lidosd.sudoers.new" \
+        || die "could not substitute the group name into lidosd.sudoers"
+    mv -f "$STAGE/lidosd.sudoers.new" "$STAGE/lidosd.sudoers"
+    if grep -Fq '@@SLEEP_GROUP@@' "$STAGE/lidosd.sudoers"; then
+        die "placeholder still present in the staged lidosd.sudoers after substitution"
+    fi
     chmod 755 "$STAGE/lidosd" "$STAGE/anythingllm-caffeinate.sh"
     chmod 644 "$STAGE/$DAEMON_LABEL.plist" "$STAGE/$AGENT_LABEL.plist"
     chmod 440 "$STAGE/lidosd.sudoers"
@@ -214,10 +285,13 @@ main() {
     fi
 
     # the user name and paths are hard-wired in several files; refuse if they disagree
-    # grep -q "^$OWNER_USER[[:space:]]" "$STAGE/lidosd.sudoers" \
-        # || die "lidosd.sudoers does not grant a rule to '$OWNER_USER'"
-    grep -Eq "^([[:space:]]*|[^#=]*[[:space:],])$OWNER_USER[[:space:],][^=]*=" "$STAGE/lidosd.sudoers" \
-        || die "lidosd.sudoers does not grant a rule to '$OWNER_USER'"
+    grep -Eq "^%$SLEEP_GROUP[[:space:]]+ALL=\(root\)[[:space:]]+NOPASSWD:" "$STAGE/lidosd.sudoers" \
+        || die "lidosd.sudoers does not grant a rule to group '$SLEEP_GROUP'"
+    grep -Fq "$HELPER_DIR/lidosd" "$STAGE/lidosd.sudoers" \
+        || die "lidosd.sudoers does not name $HELPER_DIR/lidosd"
+    if grep -Eq '^[^#]*%admin' "$STAGE/lidosd.sudoers"; then
+        die "lidosd.sudoers grants NOPASSWD to %admin; the decided rule is %$SLEEP_GROUP only"
+    fi
     grep -q "^OWNER_USER=$OWNER_USER\$" "$STAGE/lidosd" \
         || die "lidosd does not set OWNER_USER=$OWNER_USER"
     grep -Fq "OWNER_USER=\${OWNER_USER:-$OWNER_USER}" "$STAGE/anythingllm-caffeinate.sh" \
@@ -287,11 +361,13 @@ main() {
         warn "$OWNER_USER has no GUI session; the agent will start at their next login"
     fi
 
+    group_warnings
+
     cat <<EOF
 
 Done. Verify:
   tail /var/log/lidosd.log
-  sudo -u $OWNER_USER /usr/local/sbin/lidosd status
+  sudo -u $OWNER_USER $HELPER_DIR/lidosd status
   pmset -g assertions        # while $OWNER_USER's AnythingLLM is running
 To remove everything:  sudo bash '$SRC/uninstall.sh'
 EOF

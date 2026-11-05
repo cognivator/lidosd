@@ -1,7 +1,9 @@
 # /etc/sudoers.d/lidosd  (mode 440, root:wheel)
-# Lets llmserver or an Admin user arm / disarm the lid-close OSD without a password.
+# TEMPLATE: install.sh substitutes the group name (--group) and installs the result.
+# Lets members of group @@SLEEP_GROUP@@ arm / disarm the lid-close OSD without a password.
 # The "" entry means "no arguments allowed"; `disarm` is listed explicitly.
 # Do NOT allow bare `lidosd` with any arguments (that would expose `daemon`).
 #
-# Validate before installing:  sudo visudo -cf lidosd.sudoers
-%admin, llmserver ALL=(root) NOPASSWD: /usr/local/sbin/lidosd "", /usr/local/sbin/lidosd disarm
+# `visudo -cf` is EXPECTED TO FAIL on this template; validate the substituted
+# (staged) copy that install.sh writes, not this file.
+%@@SLEEP_GROUP@@ ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/lidosd "", /Library/PrivilegedHelperTools/lidosd disarm
