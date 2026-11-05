@@ -4,16 +4,19 @@
 Keep all of these together in one folder / git repo, e.g. `/Users/Shared/<reponame>/`:
 
 - `install.sh` / `uninstall.sh` : deploy / remove everything (below)
-- `anythingllm-caffeinate.sh` : holds idle + system sleep assertions while llmserver's AnythingLLM runs
+- `anythingllm-caffeinate.sh` : holds idle + system sleep assertions while llmserver's AnythingLLM Docker container runs (it wraps `docker wait`)
 - `com.llmserver.anythingllm-caffeinate.plist` : LaunchAgent that keeps that script running
 - `lidosd` : OSD command and root watcher daemon (one script, subcommands)
 - `com.llmserver.lidosd.plist` : LaunchDaemon that runs `lidosd daemon` as root
 - `lidosd.sudoers` : template for the sudoers rule; `install.sh --group NAME` fills in the group whose members may run `lidosd` / `lidosd disarm` without a password
 
-Process identity (both scripts): exact name `AnythingLLM` AND owner `llmserver`
-(`pgrep -x -u llmserver AnythingLLM`). Other users' AnythingLLM processes are ignored.
-If the account or app name differs, change it everywhere: the `OWNER_USER` / `APP_NAME`
-constants in BOTH `lidosd` and `anythingllm-caffeinate.sh`, the home path in the agent plist, and the `OWNER_USER=llmserver` constant near the top of `install.sh` and `uninstall.sh`. (The sudoers rule names a group, not the account, so it needs no change; add the new account to that group.) `install.sh` checks that these agree and refuses to install if not.
+Process identity: `lidosd` (arm check and daemon) still matches the exact name `AnythingLLM`
+AND owner `llmserver` (`pgrep -x -u llmserver AnythingLLM`); other users' AnythingLLM
+processes are ignored. That is the Desktop app, and the check is to be replaced by a
+Docker-aware one. `anythingllm-caffeinate.sh` checks no process: it holds the assertions
+while the container named by `CONTAINER` (default `anythingllm`) runs in llmserver's Docker.
+
+If the account differs, change it everywhere: the `OWNER_USER` constant in `lidosd`, the home path in the agent plist, and the `OWNER_USER=llmserver` constant near the top of `install.sh` and `uninstall.sh`. (The sudoers rule names a group, not the account, so it needs no change; add the new account to that group.) `install.sh` checks that `lidosd`'s `OWNER_USER` and the agent plist's script path agree with it, and refuses to install if not. If the container name or the Docker CLI path differs, change `CONTAINER` or `DOCKER` in `anythingllm-caffeinate.sh`; `install.sh` does not check those.
 
 The three root-run scripts (`install.sh`, `uninstall.sh`, `lidosd`) fix their own `PATH`
 and `umask` and ignore environment variables: only the constants in the files count.
@@ -53,7 +56,7 @@ control (other than sticky ones like `/Users/Shared`).
    rule and starts nothing,
 5. installs the sudoers rule, validates the full config with `visudo -c`, and restores
    the previous rule (or removes the new one) if that fails,
-6. writes llmserver's files (`~/bin`, `~/Library/LaunchAgents`) AS llmserver, so a symlink
+6. writes llmserver's files (`~/.local/bin`, `~/Library/LaunchAgents`) AS llmserver, so a symlink
    planted there cannot redirect a root write,
 7. loads the lid daemon (system) and the keep-awake agent (llmserver's GUI session;
    if llmserver isn't logged in, the agent starts at its next login),
@@ -124,7 +127,7 @@ Files inside llmserver's home are removed AS llmserver, so a symlink planted the
 make root delete something else. It keeps going if a step fails and reports warnings.
 It leaves the source folder, `/var/log/lidosd.log`, the group named by `--group` (remove it
 yourself if it is unused), and the shared directories `/Library/PrivilegedHelperTools` and
-`~llmserver/bin` (the latter is removed only if empty).
+`~llmserver/.local/bin` (other files live there).
 
 ## Security
 `lidosd` is run as root (daemon and NOPASSWD sudo), so it and its
@@ -139,3 +142,7 @@ directory that isn't a real root-owned, non-group/other-writable directory, and 
   the sudoers rule changed from `%admin` plus `llmserver` to a single group (`sleepers` on
   this Mac). The live setup was changed first; the repo was updated to match afterwards.
   See `impl/lidosd-relocation-runbook.md` in the llmserver-mbp docs.
+- 2026-11-05: The keep-awake script and agent plist were synced to the live Docker versions
+  (installed under `~/.local/bin`; the trigger is the container `anythingllm` running).
+  `lidosd`'s arm check, "Before first use" and test items 5 to 8 still describe the Desktop
+  process until the Docker-aware check lands.

@@ -15,7 +15,7 @@
 #   root       /Library/PrivilegedHelperTools/lidosd
 #              /Library/LaunchDaemons/com.llmserver.lidosd.plist   (loaded)
 #              /etc/sudoers.d/lidosd                               (validated; grants group NAME)
-#   llmserver  ~/bin/anythingllm-caffeinate.sh
+#   llmserver  ~/.local/bin/anythingllm-caffeinate.sh
 #              ~/Library/LaunchAgents/com.llmserver.anythingllm-caffeinate.plist
 #              (loaded now if llmserver has a GUI session, else at next login)
 #
@@ -34,8 +34,8 @@
 #   * Existing shared directories (e.g. /Library/PrivilegedHelperTools) are never chown'd or
 #     chmod'd; missing ones are created root:wheel 755.
 #
-# OWNER_USER is a constant below and must match lidosd, anythingllm-caffeinate.sh,
-# lidosd.sudoers and the agent plist (checked before installing).
+# OWNER_USER is a constant below and must match lidosd (checked before installing).
+# The agent plist must name the script under OWNER_HOME/.local/bin (also checked).
 #
 # Test mode: INSTALL_TEST=1 plus DESTDIR (stage under a prefix) enables the
 # overrides DESTDIR, OWNER_USER, OWNER_HOME, ROOT_GROUP and LAUNCHCTL (unset
@@ -236,7 +236,7 @@ main() {
     DAEMONS=$DESTDIR/Library/LaunchDaemons
     SUDOERS_D=$DESTDIR/etc/sudoers.d
     AGENT_DIR=$DESTDIR$OWNER_HOME/Library/LaunchAgents
-    OWNER_BIN=$DESTDIR$OWNER_HOME/bin
+    OWNER_BIN=$DESTDIR$OWNER_HOME/.local/bin
 
     # ---- sources: must be plain files that OWNER_USER cannot influence
     files="lidosd anythingllm-caffeinate.sh lidosd.sudoers $DAEMON_LABEL.plist $AGENT_LABEL.plist"
@@ -294,10 +294,8 @@ main() {
     fi
     grep -q "^OWNER_USER=$OWNER_USER\$" "$STAGE/lidosd" \
         || die "lidosd does not set OWNER_USER=$OWNER_USER"
-    grep -Fq "OWNER_USER=\${OWNER_USER:-$OWNER_USER}" "$STAGE/anythingllm-caffeinate.sh" \
-        || die "anythingllm-caffeinate.sh does not default OWNER_USER to '$OWNER_USER'"
-    grep -Fq "$OWNER_HOME/bin/anythingllm-caffeinate.sh" "$STAGE/$AGENT_LABEL.plist" \
-        || die "agent plist does not reference $OWNER_HOME/bin/anythingllm-caffeinate.sh"
+    grep -Fq "$OWNER_HOME/.local/bin/anythingllm-caffeinate.sh" "$STAGE/$AGENT_LABEL.plist" \
+        || die "agent plist does not reference $OWNER_HOME/.local/bin/anythingllm-caffeinate.sh"
 
     # ---- nothing has changed yet: refuse now if OWNER_USER could tamper with root-run paths
     verify_root_paths || die "refusing to install: fix ownership/permissions of the paths above (e.g. sudo chown root:wheel DIR; sudo chmod go-w DIR, or remove $OWNER_USER from the owning group), then re-run. Nothing was changed."   # PRE-CHECK
@@ -368,7 +366,7 @@ main() {
 Done. Verify:
   tail /var/log/lidosd.log
   sudo -u $OWNER_USER $HELPER_DIR/lidosd status
-  pmset -g assertions        # while $OWNER_USER's AnythingLLM is running
+  pmset -g assertions        # while the anythingllm container is running
 To remove everything:  sudo bash '$SRC/uninstall.sh'
 EOF
 }

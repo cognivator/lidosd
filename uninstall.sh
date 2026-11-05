@@ -5,9 +5,9 @@
 #
 # Removes: lidosd, both launchd plists (after unloading them), the sudoers rule,
 # llmserver's keep-awake script, and the lidosd state directory.
-# Leaves in place: this source folder, /var/log/lidosd.log, and the (possibly
-# shared) directories /Library/PrivilegedHelperTools and ~llmserver/bin (the latter
-# is removed only if now empty), and the macOS group that install.sh --group named
+# Leaves in place: this source folder, /var/log/lidosd.log, and the shared
+# directories /Library/PrivilegedHelperTools and ~llmserver/.local/bin (other files
+# live there), and the macOS group that install.sh --group named
 # (this script takes no group parameter; remove the group yourself if it is unused).
 # Unloading the lid daemon runs its shutdown handler (`pmset -a disablesleep 0`);
 # this script also sets it explicitly as a safeguard.
@@ -112,9 +112,8 @@ main() {
             /?*)
                 say "Removing keep-awake agent files (as $OWNER_USER)"
                 as_owner /bin/rm -f "$DESTDIR$OWNER_HOME/Library/LaunchAgents/$AGENT_LABEL.plist" \
-                                    "$DESTDIR$OWNER_HOME/bin/anythingllm-caffeinate.sh" \
+                                    "$DESTDIR$OWNER_HOME/.local/bin/anythingllm-caffeinate.sh" \
                     || warn "could not remove one or more of $OWNER_USER's agent files"
-                as_owner /bin/rmdir "$DESTDIR$OWNER_HOME/bin" 2>/dev/null || true   # only if now empty
                 ;;
             *)
                 warn "could not determine home of $OWNER_USER; its agent files were not removed"

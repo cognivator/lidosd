@@ -2,41 +2,34 @@
 # anythingllm-caffeinate.sh
 #
 # Holds idle-sleep (-i) and system-sleep (-s) assertions for exactly as long as
-# the AnythingLLM main process OWNED BY $OWNER_USER is alive. AnythingLLM
-# processes of other users are ignored. No display assertion (-d) is taken, so
-# the display may sleep without causing idle or system sleep.
+# the AnythingLLM Docker container is running. `caffeinate` wraps `docker wait`,
+# which blocks until the container stops, so the assertions end when the
+# container does (or if the Docker connection drops). No display assertion (-d).
+# -s only takes effect on AC power; -i covers battery.
 #
-# Process identity = exact process name ($APP_NAME) AND owning user ($OWNER_USER):
-#     pgrep -x -u llmserver AnythingLLM
-#   -x  exact name match (excludes "AnythingLLM Helper (...)" Electron helpers)
-#   -u  effective user (name or uid); for a GUI app this is the launching user
-# Keep APP_NAME / OWNER_USER in sync with the same constants in lidosd.
+# The container's process lives inside Docker Desktop's Linux VM and has no macOS
+# PID, so `docker wait` is the nearest macOS-side stand-in for its lifetime.
 #
-# Runs as llmserver (LaunchAgent, GUI session). Install: ~/bin/anythingllm-caffeinate.sh
-#
-# BEFORE USING, as llmserver:
-#     pgrep -lx -u llmserver AnythingLLM     # should print exactly one PID
-#     pgrep -fl AnythingLLM                  # all users' processes, incl. helpers
-#
-# Note: lidosd reverts to `idle` when this process exits; that is done by the
-# lidosd daemon itself (it watches the same process), not by this script.
+# Runs as llmserver (LaunchAgent, GUI session). Install: ~/.local/bin/anythingllm-caffeinate.sh
+# lidosd has its own, separate check (still Desktop-based; to be updated).
 
-APP_NAME=${APP_NAME:-AnythingLLM}
-OWNER_USER=${OWNER_USER:-llmserver}
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+DOCKER=${DOCKER:-/usr/local/bin/docker}
+CONTAINER=${CONTAINER:-anythingllm}
 CAFFEINATE=${CAFFEINATE:-/usr/bin/caffeinate}
-PGREP=${PGREP:-/usr/bin/pgrep}
-POLL=${POLL:-5}
+POLL=${POLL:-10}
+
+cpid=
+trap '[ -n "$cpid" ] && kill "$cpid" 2>/dev/null; exit 0' TERM INT
+
+running() { [ "$("$DOCKER" inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
 
 while true; do
-    # lowest matching PID among this user's processes
-    pid=$("$PGREP" -x -u "$OWNER_USER" "$APP_NAME" | /usr/bin/head -1)
-
-    if [ -n "$pid" ]; then
-        # Blocks until $pid exits; assertions are released automatically.
-        # -s only takes effect on AC power; -i covers battery.
-        "$CAFFEINATE" -i -s -w "$pid"
-        sleep 1     # guard against a hot loop if caffeinate fails instantly
-    else
-        sleep "$POLL"   # app not running: hold nothing, poll for it
+    if running; then
+        "$CAFFEINATE" -i -s "$DOCKER" wait "$CONTAINER" >/dev/null 2>&1 &
+        cpid=$!
+        wait "$cpid"          # returns when the container stops or the connection drops
+        cpid=
     fi
+    sleep "$POLL" & wait $!   # also the guard against a hot loop
 done
