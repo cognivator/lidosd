@@ -6,8 +6,9 @@
 # Removes: lidosd, both launchd plists (after unloading them), the sudoers rule,
 # llmserver's keep-awake script, and the lidosd state directory.
 # Leaves in place: this source folder, /var/log/lidosd.log, and the (possibly
-# shared) directories /usr/local/sbin and ~llmserver/bin (the latter is removed
-# only if now empty).
+# shared) directories /Library/PrivilegedHelperTools and ~llmserver/bin (the latter
+# is removed only if now empty), and the macOS group that install.sh --group named
+# (this script takes no group parameter; remove the group yourself if it is unused).
 # Unloading the lid daemon runs its shutdown handler (`pmset -a disablesleep 0`);
 # this script also sets it explicitly as a safeguard.
 #
@@ -29,6 +30,7 @@ set -u
 
 DAEMON_LABEL=com.llmserver.lidosd
 AGENT_LABEL=com.llmserver.anythingllm-caffeinate
+HELPER_DIR=/Library/PrivilegedHelperTools
 SUDO=/usr/bin/sudo
 
 if [ "${UNINSTALL_TEST:-}" = 1 ]; then
@@ -74,7 +76,7 @@ main() {
     [ "$OWNER_USER" != root ] || die "OWNER_USER must not be root"
     cd /
 
-    SBIN=$DESTDIR/usr/local/sbin
+    SBIN=$DESTDIR$HELPER_DIR
     DAEMONS=$DESTDIR/Library/LaunchDaemons
     SUDOERS_D=$DESTDIR/etc/sudoers.d
 
@@ -127,7 +129,8 @@ main() {
 Done. Verify:
   pmset -g | grep SleepDisabled      # expect 0
   pmset -g assertions                # no caffeinate from the keep-awake agent
-  ls /usr/local/sbin/lidosd /etc/sudoers.d/lidosd   # both gone
+  ls $HELPER_DIR/lidosd /etc/sudoers.d/lidosd   # both gone
+The group named by install.sh --group was left in place; remove it yourself if unused.
 EOF
 }
 
