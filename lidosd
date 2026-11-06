@@ -4,10 +4,10 @@
 # Usage:
 #   lidosd           arm the OSD: lid-close sleep is disabled until the lid has
 #                    been closed and then reopened (auto re-enable), until
-#                    `lidosd disarm` is run, or until AnythingLLM (owned by
-#                    OWNER_USER) exits - whichever happens first
+#                    `lidosd disarm` is run, or until the AnythingLLM container
+#                    stops - whichever happens first
 #   lidosd disarm    re-enable lid-close sleep immediately
-#   lidosd status    show state, SleepDisabled flag, lid position, app status
+#   lidosd status    show state, SleepDisabled flag, lid position
 #   lidosd daemon    internal: watcher loop run by launchd as root
 #
 # Mechanism
@@ -19,13 +19,14 @@
 #        idle --(lidosd)--> armed --(lid closes)--> closed --(lid opens)--> idle
 #                             |                        |
 #                             +--(lidosd disarm)-------+--> idle
-#                             +--(app exits)-----------+--> idle
+#                             +--(container stops)-----+--> idle
 #
 #     Lid position comes from IOKit AppleClamshellState (Yes = closed).
 #     On every transition to idle, `pmset -a disablesleep 0` is applied.
-#   * "App" = exact process name APP_NAME owned by OWNER_USER (same identity
-#     rule as anythingllm-caffeinate.sh; other users' copies are ignored).
-#     Arming is refused if that process is not running.
+#   * "Container" = the Docker container CONTAINER, asked as OWNER_USER with
+#     `sudo -u OWNER_USER -H docker inspect` (the same check as
+#     anythingllm-caffeinate.sh). Arming is refused if the first check fails;
+#     while armed or closed, FAIL_LIMIT consecutive failed checks disarm.
 #
 # Security (this script runs as root, and OWNER_USER can reach it through sudo)
 #   * PATH and umask are fixed; every external tool is called by absolute path
@@ -38,13 +39,18 @@
 #     /Library/PrivilegedHelperTools/lidosd with canonical arguments (never $0 / caller input).
 #     See lidosd.sudoers, which allows only `lidosd` and `lidosd disarm`.
 #     At most one argument is accepted, and it must be arm | disarm | status | daemon.
+#   * The container check runs as OWNER_USER (`sudo -n -u OWNER_USER -H`, absolute
+#     docker path, bounded by CHECK_TIMEOUT). Its answer is untrusted: only the
+#     exact text "true" counts, and an error or a hang counts as not running.
+#     That account controls its own docker config, so the check gates stale
+#     arms; it does not bound a caller that wants to stay armed.
 #   * The state directory must be a real directory owned by root and not
 #     group/other-writable; otherwise lidosd refuses to read or write state.
 #     A missing, unreadable or unrecognized state fails safe to "disarm".
 #
 # Polling trade-off: a lid close+reopen faster than POLL seconds can be missed;
 # the OSD then simply stays armed until the next observed close/reopen, or
-# `lidosd disarm`, or the app exits.
+# `lidosd disarm`, or the container stops.
 #
 # Install as root-owned, mode 755, in a root-owned directory (/Library/PrivilegedHelperTools);
 # install.sh checks this.
@@ -54,29 +60,33 @@ export PATH
 umask 022
 set -u
 
-# ---- constants. Keep OWNER_USER / APP_NAME in sync with anythingllm-caffeinate.sh,
-# ---- lidosd.sudoers and install.sh (install.sh checks OWNER_USER).
+# ---- constants. Keep OWNER_USER / DOCKER / CONTAINER in sync with
+# ---- anythingllm-caffeinate.sh, lidosd.sudoers and install.sh (install.sh
+# ---- checks OWNER_USER).
 OWNER_USER=llmserver
-APP_NAME=AnythingLLM
+DOCKER=/usr/local/bin/docker
+CONTAINER=anythingllm
 SELF=/Library/PrivilegedHelperTools/lidosd
 SUDO=/usr/bin/sudo
 PMSET=/usr/bin/pmset
 IOREG=/usr/sbin/ioreg
-PGREP=/usr/bin/pgrep
 STATE_DIR=/var/db/lidosd
 POLL=5
+CHECK_TIMEOUT=4     # seconds before a container check is killed
+FAIL_LIMIT=3        # consecutive failed checks (armed or closed) before disarm
 SKIP_ROOT=0
 
 # ---- test mode (never honored under sudo)
 if [ "${LIDOSD_TEST:-}" = 1 ] && [ -z "${SUDO_USER:-}" ]; then
     OWNER_USER=${LIDOSD_OWNER_USER:-$OWNER_USER}
-    APP_NAME=${LIDOSD_APP_NAME:-$APP_NAME}
+    DOCKER=${LIDOSD_DOCKER:-$DOCKER}
+    CONTAINER=${LIDOSD_CONTAINER:-$CONTAINER}
     SUDO=${LIDOSD_SUDO:-$SUDO}
     PMSET=${LIDOSD_PMSET:-$PMSET}
     IOREG=${LIDOSD_IOREG:-$IOREG}
-    PGREP=${LIDOSD_PGREP:-$PGREP}
     STATE_DIR=${LIDOSD_STATE_DIR:-$STATE_DIR}
     POLL=${LIDOSD_POLL:-$POLL}
+    CHECK_TIMEOUT=${LIDOSD_CHECK_TIMEOUT:-$CHECK_TIMEOUT}
     SKIP_ROOT=${LIDOSD_SKIP_ROOT:-0}
 fi
 STATE_FILE="$STATE_DIR/state"
@@ -98,7 +108,24 @@ lid_closed() {
         | grep -q 'AppleClamshellState" = Yes'
 }
 
-app_running() { "$PGREP" -x -u "$OWNER_USER" "$APP_NAME" >/dev/null 2>&1; }
+# True only if `docker inspect`, run AS $OWNER_USER, prints exactly "true".
+# The answer is untrusted (that account controls its own docker config), so
+# anything else, a failure, or a call outliving CHECK_TIMEOUT counts as not
+# running. macOS has no timeout(1): a background watchdog kills the call.
+container_running() {
+    local out
+    out=$(
+        "$SUDO" -n -u "$OWNER_USER" -H "$DOCKER" inspect \
+            --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null &
+        cpid=$!
+        ( sleep "$CHECK_TIMEOUT"; kill "$cpid" 2>/dev/null
+          sleep 1; kill -9 "$cpid" 2>/dev/null ) >/dev/null 2>&1 &
+        wpid=$!
+        wait "$cpid" 2>/dev/null
+        kill "$wpid" 2>/dev/null
+    )
+    [ "$out" = true ]
+}
 
 ensure_state_dir() {
     if [ ! -e "$STATE_DIR" ]; then
@@ -132,13 +159,13 @@ set_state() {
 }
 
 arm() {
-    if ! app_running; then
-        echo "lidosd: $APP_NAME is not running for user $OWNER_USER; not arming." >&2
+    if ! container_running; then
+        echo "lidosd: container $CONTAINER is not running (checked as $OWNER_USER); not arming." >&2
         exit 1
     fi
     set_state armed || exit 1
     "$PMSET" -a disablesleep 1
-    log "armed: lid-close sleep disabled until lid closes and reopens (or app exits)"
+    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)"
     if lid_closed; then
         echo "Note: lid is already closed; the Mac may have slept or be in clamshell mode." >&2
     fi
@@ -152,13 +179,14 @@ disarm() {
 }
 
 daemon() {
-    local state
+    local state fails=0
     trap 'disarm; exit 0' TERM INT
 
     # Reconcile after a (re)start so a crash cannot leave sleep disabled forever.
+    # One failed check is enough here: a failure fails safe to disarm.
     state=$(get_state)
-    if [ "$state" != idle ] && ! app_running; then
-        log "$APP_NAME (user $OWNER_USER) not running at startup"
+    if [ "$state" != idle ] && ! container_running; then
+        log "container $CONTAINER (as $OWNER_USER) not running at startup"
         disarm
     else
         case "$state" in
@@ -175,16 +203,23 @@ daemon() {
         sleep "$POLL" & wait $!
 
         state=$(get_state)
-        [ "$state" = idle ] && continue
+        if [ "$state" = idle ]; then fails=0; continue; fi
 
         if [ "$state" = invalid ]; then
             log "unreadable or unrecognized state; failing safe"
+            fails=0
             disarm
             continue
         fi
 
-        if ! app_running; then
-            log "$APP_NAME (user $OWNER_USER) exited"
+        # armed or closed: a hung or failed check counts; FAIL_LIMIT in a row disarm
+        if container_running; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            if [ "$fails" -lt "$FAIL_LIMIT" ]; then continue; fi
+            log "container $CONTAINER (as $OWNER_USER) not running ($fails consecutive checks)"
+            fails=0
             disarm
             continue
         fi
@@ -199,7 +234,7 @@ daemon() {
 status() {
     echo "state:         $(get_state)"
     echo "lid:           $(lid_closed && echo closed || echo open)"
-    echo "app ($OWNER_USER): $(app_running && echo running || echo 'not running')"
+    echo "container:     checked by the daemon while armed"
     echo "SleepDisabled: $("$PMSET" -g 2>/dev/null | awk '/SleepDisabled/ {print $2}')"
 }
 
