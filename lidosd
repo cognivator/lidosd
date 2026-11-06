@@ -6,8 +6,14 @@
 #                    been closed and then reopened (auto re-enable), until
 #                    `lidosd disarm` is run, or until the AnythingLLM container
 #                    stops - whichever happens first
+#   lidosd [arm] -l MINUTES    (also: --limit=MINUTES, --limit MINUTES, -lMINUTES)
+#                    as above, and also disarm after MINUTES (0 to 1440; 0 or no
+#                    -l means no limit). The clock starts at arm; a re-arm with
+#                    -l replaces the limit and a plain `lidosd` clears it. If the
+#                    lid is closed when the limit ends, the Mac then sleeps and
+#                    the service drops until someone opens the lid.
 #   lidosd disarm    re-enable lid-close sleep immediately
-#   lidosd status    show state, SleepDisabled flag, lid position
+#   lidosd status    show state, lid position, time left on a limit, SleepDisabled flag
 #   lidosd daemon    internal: watcher loop run by launchd as root
 #
 # Mechanism
@@ -20,6 +26,7 @@
 #                             |                        |
 #                             +--(lidosd disarm)-------+--> idle
 #                             +--(container stops)-----+--> idle
+#                             +--(limit reached)-------+--> idle
 #
 #     Lid position comes from IOKit AppleClamshellState (Yes = closed).
 #     On every transition to idle, `pmset -a disablesleep 0` is applied.
@@ -27,6 +34,11 @@
 #     `sudo -u OWNER_USER -H docker inspect` (the same check as
 #     anythingllm-caffeinate.sh). Arming is refused if the first check fails;
 #     while armed or closed, FAIL_LIMIT consecutive failed checks disarm.
+#   * Limit (optional): the deadline (epoch seconds) is kept in its own root-owned
+#     file /var/db/lidosd/deadline, written before the state. The daemon disarms
+#     when it passes, and also when the file exists but is unreadable or not a
+#     number (fail safe). A missing file means no limit. Every transition to
+#     idle removes it.
 #
 # Security (this script runs as root, and OWNER_USER can reach it through sudo)
 #   * PATH and umask are fixed; every external tool is called by absolute path
@@ -37,8 +49,11 @@
 #     caller.
 #   * An unprivileged caller is re-executed through `sudo -n` on the FIXED path
 #     /Library/PrivilegedHelperTools/lidosd with canonical arguments (never $0 / caller input).
-#     See lidosd.sudoers, which allows only `lidosd` and `lidosd disarm`.
-#     At most one argument is accepted, and it must be arm | disarm | status | daemon.
+#     See lidosd.sudoers, which allows only `lidosd`, `lidosd disarm` and
+#     `lidosd -l N` (N from 0 to MAX_LIMIT, no leading zeros).
+#     Arguments are parsed strictly (parse_args), at the caller and again as
+#     root, because sudoers is only a coarse gate: arm | disarm | status | daemon,
+#     and -l only with arm.
 #   * The container check runs as OWNER_USER (`sudo -n -u OWNER_USER -H`, absolute
 #     docker path, bounded by CHECK_TIMEOUT). Its answer is untrusted: only the
 #     exact text "true" counts, and an error or a hang counts as not running.
@@ -74,6 +89,7 @@ STATE_DIR=/var/db/lidosd
 POLL=5
 CHECK_TIMEOUT=4     # seconds before a container check is killed
 FAIL_LIMIT=3        # consecutive failed checks (armed or closed) before disarm
+MAX_LIMIT=1440      # largest `-l MINUTES` (24 h); keep in sync with the top pattern in lidosd.sudoers
 SKIP_ROOT=0
 
 # ---- test mode (never honored under sudo)
@@ -90,10 +106,47 @@ if [ "${LIDOSD_TEST:-}" = 1 ] && [ -z "${SUDO_USER:-}" ]; then
     SKIP_ROOT=${LIDOSD_SKIP_ROOT:-0}
 fi
 STATE_FILE="$STATE_DIR/state"
+DEADLINE_FILE="$STATE_DIR/deadline"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') lidosd: $*"; }
 
-usage() { echo "usage: lidosd [disarm|status]" >&2; exit 2; }
+usage() {
+    echo "usage: lidosd [arm] [-l MINUTES | --limit=MINUTES] | disarm | status" >&2
+    echo "       MINUTES is 0 to $MAX_LIMIT; 0 or no -l means no limit" >&2
+    exit 2
+}
+
+# Strict parsing: sudo joins arguments with spaces and sudoers is only a coarse
+# gate, so the script validates for itself, at the caller and again as root.
+# set_limit VALUE : digits only, at most 4 of them, 0..MAX_LIMIT, given once.
+# Leading zeros are canonicalized with 10# (05 -> 5, 0000 -> 0).
+set_limit() {
+    [ -z "$LIMIT" ] || usage
+    case "$1" in ''|*[!0-9]*) usage ;; esac
+    [ ${#1} -le 4 ] || usage
+    LIMIT=$((10#$1))
+    [ "$LIMIT" -le "$MAX_LIMIT" ] || usage
+}
+
+# parse_args ARGS... : sets MODE (arm|disarm|status|daemon) and LIMIT (empty = not given).
+# Accepts: [arm] [-l N | -lN | --limit N | --limit=N], in any order. A limit is
+# valid only with arm.
+parse_args() {
+    MODE=
+    LIMIT=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            arm|disarm|status|daemon) [ -z "$MODE" ] || usage; MODE=$1 ;;
+            -l|--limit)               [ $# -ge 2 ] || usage; set_limit "$2"; shift ;;
+            --limit=*)                set_limit "${1#--limit=}" ;;
+            -l?*)                     set_limit "${1#-l}" ;;
+            *)                        usage ;;
+        esac
+        shift
+    done
+    [ -n "$MODE" ] || MODE=arm
+    if [ -n "$LIMIT" ] && [ "$MODE" != arm ]; then usage; fi
+}
 
 # need_root [ARGS...] : if not root, re-exec through sudo with a fixed path and
 # canonical arguments (so sudoers matches exactly); otherwise continue.
@@ -158,14 +211,52 @@ set_state() {
         && chmod 644 "$STATE_FILE"
 }
 
+# The optional limit is a deadline (epoch seconds) in its own root-owned file
+# beside the state file, so get_state and its fail-safe are unchanged.
+# deadline_left prints: none (no file) | invalid | SECONDS_LEFT (<= 0 once expired)
+deadline_left() {
+    local d
+    if [ -L "$DEADLINE_FILE" ]; then echo invalid; return; fi
+    if [ ! -e "$DEADLINE_FILE" ]; then echo none; return; fi
+    d=$(cat "$DEADLINE_FILE" 2>/dev/null) || { echo invalid; return; }
+    case "$d" in ''|*[!0-9]*) echo invalid; return ;; esac
+    [ ${#d} -le 12 ] || { echo invalid; return; }
+    echo $(( 10#$d - $(date +%s) ))
+}
+
+# True when the limit has expired or the deadline file is unreadable (fail safe).
+limit_hit() {
+    local left
+    left=$(deadline_left)
+    case "$left" in
+        none)    return 1 ;;
+        invalid) return 0 ;;
+        *)       [ "$left" -le 0 ] ;;
+    esac
+}
+
+# set_deadline MINUTES : the clock starts now; 0 clears the limit.
+set_deadline() {
+    ensure_state_dir || return 1
+    rm -f "$DEADLINE_FILE.tmp"
+    if [ "$1" -eq 0 ]; then rm -f "$DEADLINE_FILE" || return 1; return 0; fi
+    ( set -C; printf '%s\n' "$(( $(date +%s) + $1 * 60 ))" > "$DEADLINE_FILE.tmp" ) \
+        && mv -f "$DEADLINE_FILE.tmp" "$DEADLINE_FILE" && chmod 644 "$DEADLINE_FILE"
+}
+
 arm() {
     if ! container_running; then
         echo "lidosd: container $CONTAINER is not running (checked as $OWNER_USER); not arming." >&2
         exit 1
     fi
+    # The deadline is written BEFORE the state, so the daemon never sees "armed"
+    # without the limit that was asked for. -l 0 or no -l clears any old limit.
+    set_deadline "${LIMIT:-0}" || exit 1
     set_state armed || exit 1
     "$PMSET" -a disablesleep 1
-    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)"
+    local note=
+    [ "${LIMIT:-0}" -gt 0 ] && note=", limit $LIMIT min"
+    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)$note"
     if lid_closed; then
         echo "Note: lid is already closed; the Mac may have slept or be in clamshell mode." >&2
     fi
@@ -175,6 +266,7 @@ arm() {
 disarm() {
     "$PMSET" -a disablesleep 0
     set_state idle || echo "lidosd: warning: could not record state 'idle'" >&2
+    rm -f "$DEADLINE_FILE" 2>/dev/null     # every transition to idle clears the limit
     log "disarmed: lid-close sleep enabled"
 }
 
@@ -183,9 +275,13 @@ daemon() {
     trap 'disarm; exit 0' TERM INT
 
     # Reconcile after a (re)start so a crash cannot leave sleep disabled forever.
-    # One failed check is enough here: a failure fails safe to disarm.
+    # One failed check is enough here: a failure fails safe to disarm. The limit
+    # is checked first: it needs no sudo call.
     state=$(get_state)
-    if [ "$state" != idle ] && ! container_running; then
+    if [ "$state" != idle ] && limit_hit; then
+        log "limit reached (or deadline file invalid) at startup; disarming"
+        disarm
+    elif [ "$state" != idle ] && ! container_running; then
         log "container $CONTAINER (as $OWNER_USER) not running at startup"
         disarm
     else
@@ -212,7 +308,15 @@ daemon() {
             continue
         fi
 
-        # armed or closed: a hung or failed check counts; FAIL_LIMIT in a row disarm
+        # armed or closed: the limit first (no sudo call), then the container
+        if limit_hit; then
+            log "limit reached (or deadline file invalid); disarming"
+            fails=0
+            disarm
+            continue
+        fi
+
+        # a hung or failed check counts; FAIL_LIMIT in a row disarm
         if container_running; then
             fails=0
         else
@@ -232,16 +336,32 @@ daemon() {
 }
 
 status() {
-    echo "state:         $(get_state)"
+    local s left
+    s=$(get_state)
+    echo "state:         $s"
     echo "lid:           $(lid_closed && echo closed || echo open)"
     echo "container:     checked by the daemon while armed"
+    if [ "$s" = armed ] || [ "$s" = closed ]; then
+        left=$(deadline_left)
+        case "$left" in
+            none)    echo "limit:         none" ;;
+            invalid) echo "limit:         invalid (the daemon will disarm)" ;;
+            *)       if [ "$left" -le 0 ]; then
+                         echo "limit:         expired (the daemon will disarm)"
+                     else
+                         echo "limit:         $(( (left + 59) / 60 )) min left"
+                     fi ;;
+        esac
+    fi
     echo "SleepDisabled: $("$PMSET" -g 2>/dev/null | awk '/SleepDisabled/ {print $2}')"
 }
 
-[ $# -le 1 ] || usage
+parse_args "$@"
 
-case "${1:-arm}" in
-    arm)     need_root; arm ;;
+# The re-exec through sudo uses only the canonical forms sudoers allows:
+# "", `disarm` and `-l N` (N already canonicalized, no leading zeros).
+case "$MODE" in
+    arm)     if [ -n "$LIMIT" ]; then need_root -l "$LIMIT"; else need_root; fi; arm ;;
     disarm)  need_root disarm; disarm ;;
     status)  status ;;
     daemon)
