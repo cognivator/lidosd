@@ -284,14 +284,42 @@ main() {
         visudo -cf "$STAGE/lidosd.sudoers" >/dev/null || die "lidosd.sudoers failed visudo check"
     fi
 
-    # the user name and paths are hard-wired in several files; refuse if they disagree
-    grep -Eq "^%$SLEEP_GROUP[[:space:]]+ALL=\(root\)[[:space:]]+NOPASSWD:" "$STAGE/lidosd.sudoers" \
-        || die "lidosd.sudoers does not grant a rule to group '$SLEEP_GROUP'"
-    grep -Fq "$HELPER_DIR/lidosd" "$STAGE/lidosd.sudoers" \
-        || die "lidosd.sudoers does not name $HELPER_DIR/lidosd"
+    # the sudoers file must grant nothing to %admin (checked first for a clearer message)
     if grep -Eq '^[^#]*%admin' "$STAGE/lidosd.sudoers"; then
         die "lidosd.sudoers grants NOPASSWD to %admin; the decided rule is %$SLEEP_GROUP only"
     fi
+    # The staged sudoers must contain exactly the expected active lines, ignoring
+    # comments, blank lines, indentation, spacing around , : = and the line
+    # continuation backslashes. Content is exact: a changed, missing, extra or
+    # duplicated entry fails. (Moving entries to different lines is NOT tolerated.)
+    # Keep in sync with tests/sudoers-check-test.sh (it compares this block).
+    sudoers_active=$(grep -Ev '^[[:space:]]*(#|$)' "$STAGE/lidosd.sudoers" \
+        | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' \
+              -e 's/ *\\$//' -e 's/ *, *$//' \
+              -e 's/ *= */ = /' -e 's/ *: */: /' -e 's/ $//' \
+        | LC_ALL=C sort)
+    sudoers_expect=$(printf '%s\n' \
+        "Cmnd_Alias LIDOSD_CMDS =" \
+        "%$SLEEP_GROUP ALL = (root) NOPASSWD: LIDOSD_CMDS" \
+        "$HELPER_DIR/lidosd \"\"" \
+        "$HELPER_DIR/lidosd disarm" \
+        "$HELPER_DIR/lidosd -l [0-9]" \
+        "$HELPER_DIR/lidosd -l [1-9][0-9]" \
+        "$HELPER_DIR/lidosd -l [1-9][0-9][0-9]" \
+        "$HELPER_DIR/lidosd -l 1[0-3][0-9][0-9]" \
+        "$HELPER_DIR/lidosd -l 14[0-3][0-9]" \
+        "$HELPER_DIR/lidosd -l 1440" | LC_ALL=C sort)
+    if [ "$sudoers_active" != "$sudoers_expect" ]; then
+        echo "install.sh: lidosd.sudoers active lines differ from the expected set (< expected, > found):" >&2
+        diff <(printf '%s\n' "$sudoers_expect") <(printf '%s\n' "$sudoers_active") >&2 || true
+        die "lidosd.sudoers does not match the expected rule for group '$SLEEP_GROUP'"
+    fi
+    # the top pattern (1440) must agree with MAX_LIMIT in lidosd
+    max=$(sed -n 's/^MAX_LIMIT=\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$STAGE/lidosd")
+    [ "$max" = 1440 ] \
+        || die "lidosd MAX_LIMIT is '${max:-not found}' but the sudoers patterns stop at 1440; change both together"
+
+    # the user name and paths are hard-wired in several files; refuse if they disagree
     grep -q "^OWNER_USER=$OWNER_USER\$" "$STAGE/lidosd" \
         || die "lidosd does not set OWNER_USER=$OWNER_USER"
     grep -Fq "$OWNER_HOME/.local/bin/anythingllm-caffeinate.sh" "$STAGE/$AGENT_LABEL.plist" \

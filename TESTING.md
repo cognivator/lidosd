@@ -1,11 +1,14 @@
 # Testing lidosd
 
-There are two layers:
+There are three layers:
 
 1. **Logic tests** (`tests/lidosd-logic-test.sh`, described below): automated, run against a
    copy of `lidosd` in a scratch tree with fake `pmset`, `ioreg`, `sudo` and `docker`. They
    never change the live system.
-2. **Functional tests** (`INSTALL.md`, items 1 to 11): run by hand on the installed system.
+2. **Sudoers-check tests** (`tests/sudoers-check-test.sh`, see "Sudoers-check tests" at the
+   end): automated, no root needed; they test how `install.sh` validates the staged
+   `lidosd.sudoers` and the `MAX_LIMIT` agreement.
+3. **Functional tests** (`INSTALL.md`, items 1 to 11): run by hand on the installed system.
    Items 5 to 8 were written around the Desktop app process and are to be rewritten for the
    container check; a new item that arms with `-l 1` and watches the disarm is planned.
 
@@ -103,3 +106,50 @@ This was after the container check (d1) and the `-l|--limit` option (d2) were co
   prints the log tails if a check in that scenario failed.
 - `startd` starts the daemon in the background; `stop_daemon` sends it SIGTERM.
 - Update the counts in this file when checks are added or removed.
+
+## Sudoers-check tests
+
+```
+/bin/bash tests/sudoers-check-test.sh [REPO-DIR]
+```
+
+- Run as an ordinary user. It reads the repo's `lidosd.sudoers`, `install.sh` and `lidosd`
+  (found from the script's own location, or from `REPO-DIR`) and writes only to a scratch
+  directory under `/tmp`, removed on exit. It never touches the live system.
+- Output is one `PASS`, `FAIL` or `SKIP` line per check and a final count. Exit status is 0
+  when nothing failed (`SKIP` is not a failure). Written for macOS `/bin/bash` (3.2).
+
+### What it tests
+
+`install.sh` checks the staged sudoers file by normalizing its active lines and comparing
+them with the expected set for the group given by `--group`. Normalizing drops comments and
+blank lines; trims indentation; collapses runs of whitespace; makes the spacing around `,`
+`:` and `=` uniform; strips the trailing `,` and the continuation `\`; and sorts. The result
+must equal the expected 10 lines (the alias header, its 8 entries and the rule line). A
+layout change passes, a content change fails. It also reads `MAX_LIMIT` from the staged
+`lidosd` and requires 1440, the top number pattern.
+
+| Section | Checks | What is checked |
+|---|---|---|
+| 1. Layout tolerated | 8 | The committed template with the group substituted; a tab indent; no indent; a deeper indent with trailing spaces; no spaces before backslashes, around `=` or after `NOPASSWD:`; every space tripled; other comments and blank lines; the rule line first with the entries in reverse order. All must match. |
+| 2. Changes rejected | 13 | A widened pattern; a missing entry; an extra entry (`lidosd *`); an extra `%admin` rule; a duplicated entry; the wrong group; `NOPASSWD: ALL`; a renamed alias; a top entry of 1441; a wrong path; an empty file. Also two documented limits that fail on purpose: two entries joined on one line, and a space after a continuation backslash. |
+| 3. `MAX_LIMIT` | 10 | The repo `lidosd` gives 1440; a trailing comment, none, or one space is accepted; a different value is read as is; no line, a commented line, trailing text that is not a comment, an empty value and a double definition do not read as 1440. |
+| 4. Sync | 2 | The sudoers block and the `max=` line in `install.sh` equal the reference copy in the test, ignoring indentation. `SKIP` while `install.sh` does not contain them yet. |
+
+### The reference copy
+
+The code under test is written into the script (`ref-sudoers.sh` and `ref-max.sh`, as
+temporary files) and run from there. Section 4 compares it with `install.sh`, with
+`"$STAGE/lidosd.sudoers"` read as `"$F"` and `"$STAGE/lidosd"` as `"$M"`, so a change in
+one place without the other shows as a `FAIL` with a diff. Change both together.
+
+### Not covered
+
+- That real `sudo` or `visudo` accepts a reformatted variant. `install.sh` runs
+  `visudo -cf` on the staged copy as a separate step, and the test does not.
+- That real `sudo` matches the patterns (only the real reinstall shows that).
+- Reformatting that moves content between lines (see the two documented limits).
+
+### Last recorded run
+
+Not run yet (the script was written 2026-11-06, before the `install.sh` edit).
