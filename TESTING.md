@@ -152,4 +152,4 @@ one place without the other shows as a `FAIL` with a diff. Change both together.
 
 ### Last recorded run
 
-Not run yet (the script was written 2026-11-06, before the `install.sh` edit).
+2026-11-06, run by the user as an ordinary user: first run 31 passed, 0 failed, 2 skipped (before the `install.sh` edit); after it, **33 passed, 0 failed, 0 skipped**.

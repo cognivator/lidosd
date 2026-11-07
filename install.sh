@@ -3,9 +3,10 @@
 #
 #   sudo bash /Users/Shared/<reponame>/install.sh --group NAME
 #
-# --group NAME (required): the group whose members may run lidosd and
-# lidosd disarm without a password (substituted into the sudoers rule). The
-# installer does not create the group or add members; it only warns.
+# --group NAME (required): the group whose members may run lidosd without a
+# password: lidosd, lidosd disarm and lidosd -l MINUTES (0 to 1440). The name
+# is substituted into the sudoers rule. The installer does not create the
+# group or add members; it only warns.
 #
 # The source folder is located from this script's own path, so the repo name does
 # not matter. Safe to re-run: it stops the running pieces, redeploys, and starts
