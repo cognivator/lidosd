@@ -101,7 +101,7 @@ drop-in files are read alphabetically after /etc/sudoers.
     lidosd -l 90      # arm, and disarm after 90 minutes (0 to 1440; --limit=90 also works)
     lidosd disarm     # disarm now
     lidosd status
-    tail -f /var/log/lidosd.log
+    tail -f /var/log/lidosd.log   # daemon events only; arm and disarm lines print to the terminal
 
 The OSD reverts to `idle` (and `pmset disablesleep 0`) on the FIRST of: lid closed then
 reopened, `lidosd disarm`, the container stopping (3 failed checks in a row, about 15 s),
@@ -113,12 +113,17 @@ closed, the Mac then goes to sleep and the service drops until someone opens the
 `lidosd status` shows the time left; it does not run the container check (the daemon does).
 
 `lidosd` checks every `pmset ... disablesleep` call (its exit status) and then reads the
-flag back with `pmset -g`. In `/var/log/lidosd.log` a verified change is logged: the arm and
-disarm lines end in `[SleepDisabled 1 confirmed]` and `[SleepDisabled 0 confirmed]`, and the
-daemon logs `daemon start: SleepDisabled N confirmed` when it re-applies the flag at start.
+flag back with `pmset -g`. A verified change is logged with a line that ends in
+`[SleepDisabled 1 confirmed]` or `[SleepDisabled 0 confirmed]`. Where the line goes depends on
+who ran it. `lidosd` and `lidosd disarm` print their lines to the terminal and do NOT write
+them to `/var/log/lidosd.log`. Only the daemon's output reaches the file (launchd redirects it),
+so the file holds the daemon's events: `daemon start: SleepDisabled N confirmed` when it
+re-applies the flag at start, `lid closed while armed`, `lid reopened`, `limit reached`, a
+disarm because the container stopped, and the confirmed lines for those.
 A success of the exit status alone is not logged. A failure is logged with a timestamp, the
 exit status and `pmset`'s own message (`arm failed: ...`, `disarm failed: ...`, `daemon start: ...`),
-and so is a flag that does not read back as asked. What happens next:
+and so is a flag that does not read back as asked (on the terminal for the command line, in
+the file for the daemon). What happens next:
 - `lidosd` (arm): if sleep cannot be disabled it undoes the arm (state idle, limit removed)
   and exits 1.
 - `lidosd disarm`: if sleep cannot be re-enabled it exits 1 and leaves the state as it was.
@@ -152,9 +157,10 @@ test mode) are described in `TESTING.md`. The items below are the checks on the 
 14. `lidosd -l 1`, close the lid and keep it closed past the minute -> the Mac sleeps; opening the lid brings the service back.
 15. `lidosd -l 1441` and `lidosd -l abc` -> the usage message, exit 2, no sudo call.
 16. The `pmset` read-back lines. Right after the reinstall, `tail /var/log/lidosd.log` shows
-    `daemon start: SleepDisabled 0 confirmed`. After items 2 and 6, the log shows an `armed: ...
-    [SleepDisabled 1 confirmed]` line and a `disarmed: ... [SleepDisabled 0 confirmed]` line,
-    and no `failed` or `FAILED` line is new since the reinstall. This is the check that the real
+    `daemon start: SleepDisabled 0 confirmed`. Items 2 and 6 print an `armed: ...
+    [SleepDisabled 1 confirmed]` line and a `disarmed: ... [SleepDisabled 0 confirmed]` line
+    on the terminal (not in the log file), with no `failed` or `FAILED` line there, and no such
+    line is new in the log since the reinstall. This is the check that the real
     `pmset -g` shows each change at once; if a confirmed line is missing or a mismatch is
     logged, the read-back may need a short delay. The failure paths (`arm failed`, `disarm failed`,
     the retries) are covered by the logic tests only; they are not provoked on the live system.
