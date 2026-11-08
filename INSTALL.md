@@ -112,6 +112,23 @@ The limit is optional. The clock starts at arm; a plain `lidosd` clears an earli
 closed, the Mac then goes to sleep and the service drops until someone opens the lid.
 `lidosd status` shows the time left; it does not run the container check (the daemon does).
 
+`lidosd` checks every `pmset ... disablesleep` call (its exit status) and then reads the
+flag back with `pmset -g`. In `/var/log/lidosd.log` a verified change is logged: the arm and
+disarm lines end in `[SleepDisabled 1 confirmed]` and `[SleepDisabled 0 confirmed]`, and the
+daemon logs `daemon start: SleepDisabled N confirmed` when it re-applies the flag at start.
+A success of the exit status alone is not logged. A failure is logged with a timestamp, the
+exit status and `pmset`'s own message (`arm failed: ...`, `disarm failed: ...`, `daemon start: ...`),
+and so is a flag that does not read back as asked. What happens next:
+- `lidosd` (arm): if sleep cannot be disabled it undoes the arm (state idle, limit removed)
+  and exits 1.
+- `lidosd disarm`: if sleep cannot be re-enabled it exits 1 and leaves the state as it was.
+- The daemon: a failed disarm is retried on each poll (5 s), up to 12 times (about a
+  minute), with no further log lines until it works (`disarmed after N failed attempts`) or
+  gives up (`disarm FAILED after 12 retries; giving up, sleep may STILL BE DISABLED`), after
+  which the state is `idle`. `lidosd status` always shows the real `SleepDisabled` value.
+- Daemon start: if the flag cannot be re-applied for an `armed` or `closed` state, the daemon
+  disarms (it never stays armed without the flag).
+
 ## Before first use
 As llmserver: `/usr/local/bin/docker inspect --format '{{.State.Running}}' anythingllm` must print `true`.
 
@@ -134,6 +151,13 @@ test mode) are described in `TESTING.md`. The items below are the checks on the 
 13. `lidosd -l 5`, then plain `lidosd` -> `status` shows `limit: none`.
 14. `lidosd -l 1`, close the lid and keep it closed past the minute -> the Mac sleeps; opening the lid brings the service back.
 15. `lidosd -l 1441` and `lidosd -l abc` -> the usage message, exit 2, no sudo call.
+16. The `pmset` read-back lines. Right after the reinstall, `tail /var/log/lidosd.log` shows
+    `daemon start: SleepDisabled 0 confirmed`. After items 2 and 6, the log shows an `armed: ...
+    [SleepDisabled 1 confirmed]` line and a `disarmed: ... [SleepDisabled 0 confirmed]` line,
+    and no `failed` or `FAILED` line is new since the reinstall. This is the check that the real
+    `pmset -g` shows each change at once; if a confirmed line is missing or a mismatch is
+    logged, the read-back may need a short delay. The failure paths (`arm failed`, `disarm failed`,
+    the retries) are covered by the logic tests only; they are not provoked on the live system.
 
 ## Uninstall (as an admin user)
     sudo bash /Users/Shared/<reponame>/uninstall.sh
@@ -174,3 +198,9 @@ Docker config).
   The live install still has the 2026-11-01 files until `install.sh` is re-run; real sudo
   matching of the `-l` patterns and the container check from the launchd daemon are not yet
   shown.
+- 2026-11-07: every `pmset ... disablesleep` call in `lidosd` is now checked (exit status)
+  and read back with `pmset -g`; failures are logged with a timestamp, verified results are
+  logged as `SleepDisabled N confirmed`, `arm` undoes itself on failure, and the daemon
+  retries a failed disarm up to 12 times (see "Use"). Scripted tests: `TESTING.md`, section
+  6A (160 checks in all). The live install still has the 2026-11-01 files; whether the real
+  `pmset -g` reflects a change at once is not yet shown (test item 16).

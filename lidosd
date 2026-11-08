@@ -30,6 +30,11 @@
 #
 #     Lid position comes from IOKit AppleClamshellState (Yes = closed).
 #     On every transition to idle, `pmset -a disablesleep 0` is applied.
+#   * Every `pmset ... disablesleep` call is checked (exit status) and the flag is
+#     read back with `pmset -g`: failures are logged with a timestamp, a verified
+#     result is logged as "SleepDisabled N confirmed". A failed disarm in the
+#     daemon is retried on each poll, up to DISARM_RETRIES times (about 1 min),
+#     then logged as a final failure and the state is set to idle.
 #   * "Container" = the Docker container CONTAINER, asked as OWNER_USER with
 #     `sudo -u OWNER_USER -H docker inspect` (the same check as
 #     anythingllm-caffeinate.sh). Arming is refused if the first check fails;
@@ -90,6 +95,9 @@ POLL=5
 CHECK_TIMEOUT=4     # seconds before a container check is killed
 FAIL_LIMIT=3        # consecutive failed checks (armed or closed) before disarm
 MAX_LIMIT=1440      # largest `-l MINUTES` (24 h); keep in sync with the top pattern in lidosd.sudoers
+DISARM_RETRIES=12   # retries (one per POLL, about 1 min) after a failed disarm, then give up
+DISARM_TRIES=0      # failed disarm attempts so far; 0 = none pending (the daemon retries while > 0)
+SLEEP_ERR=          # reason for the last failed sleep_set
 SKIP_ROOT=0
 
 # ---- test mode (never honored under sudo)
@@ -104,6 +112,7 @@ if [ "${LIDOSD_TEST:-}" = 1 ] && [ -z "${SUDO_USER:-}" ]; then
     POLL=${LIDOSD_POLL:-$POLL}
     CHECK_TIMEOUT=${LIDOSD_CHECK_TIMEOUT:-$CHECK_TIMEOUT}
     SKIP_ROOT=${LIDOSD_SKIP_ROOT:-0}
+    DISARM_RETRIES=${LIDOSD_DISARM_RETRIES:-$DISARM_RETRIES}
 fi
 STATE_FILE="$STATE_DIR/state"
 DEADLINE_FILE="$STATE_DIR/deadline"
@@ -244,6 +253,28 @@ set_deadline() {
         && mv -f "$DEADLINE_FILE.tmp" "$DEADLINE_FILE" && chmod 644 "$DEADLINE_FILE"
 }
 
+# sleep_disabled : the flag as pmset reports it (1, 0, or empty if unreadable)
+sleep_disabled() { "$PMSET" -g 2>/dev/null | awk '/SleepDisabled/ {print $2}'; }
+
+# sleep_set N : `pmset -a disablesleep N`, then read the flag back. Silent; on
+# failure it sets SLEEP_ERR (the exit status and pmset's message, or the
+# mismatch) and returns 1. Callers decide what to log.
+sleep_set() {
+    local want=$1 out rc got nl=$'\n'
+    SLEEP_ERR=
+    out=$("$PMSET" -a disablesleep "$want" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        SLEEP_ERR="pmset -a disablesleep $want failed (exit $rc): ${out//"$nl"/ }"
+        return 1
+    fi
+    got=$(sleep_disabled)
+    if [ "$got" != "$want" ]; then
+        SLEEP_ERR="pmset -a disablesleep $want exited 0 but SleepDisabled reads '${got:-unreadable}'"
+        return 1
+    fi
+    return 0
+}
+
 arm() {
     if ! container_running; then
         echo "lidosd: container $CONTAINER is not running (checked as $OWNER_USER); not arming." >&2
@@ -253,21 +284,75 @@ arm() {
     # without the limit that was asked for. -l 0 or no -l clears any old limit.
     set_deadline "${LIMIT:-0}" || exit 1
     set_state armed || exit 1
-    "$PMSET" -a disablesleep 1
+    if ! sleep_set 1; then
+        log "arm failed: $SLEEP_ERR"
+        echo "lidosd: could not disable lid-close sleep: $SLEEP_ERR" >&2
+        # undo, so a half-armed state is not left behind
+        if sleep_set 0; then
+            log "arm undone: SleepDisabled 0 confirmed"
+        else
+            log "arm undo failed: $SLEEP_ERR"
+        fi
+        set_state idle
+        rm -f "$DEADLINE_FILE" 2>/dev/null
+        exit 1
+    fi
     local note=
     [ "${LIMIT:-0}" -gt 0 ] && note=", limit $LIMIT min"
-    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)$note"
+    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)$note [SleepDisabled 1 confirmed]"
     if lid_closed; then
         echo "Note: lid is already closed; the Mac may have slept or be in clamshell mode." >&2
     fi
 }
 
-# Sleep is re-enabled FIRST; recording the state is best effort.
-disarm() {
-    "$PMSET" -a disablesleep 0
+# disarm_try : re-enable sleep FIRST and verify it; recording the state is best
+# effort. On success: state idle, limit cleared. On failure: return 1 with
+# SLEEP_ERR set and the state untouched.
+disarm_try() {
+    sleep_set 0 || return 1
     set_state idle || echo "lidosd: warning: could not record state 'idle'" >&2
     rm -f "$DEADLINE_FILE" 2>/dev/null     # every transition to idle clears the limit
-    log "disarmed: lid-close sleep enabled"
+    return 0
+}
+
+disarm() {
+    if disarm_try; then
+        log "disarmed: lid-close sleep enabled [SleepDisabled 0 confirmed]"
+        DISARM_TRIES=0
+        return 0
+    fi
+    log "disarm failed: $SLEEP_ERR"
+    DISARM_TRIES=1          # the daemon retries on each poll; the command line just exits 1
+    return 1
+}
+
+# Daemon only: called on each poll while DISARM_TRIES > 0 (a disarm failed).
+# Silent until it works or gives up; disarm() logged the first failure.
+retry_disarm() {
+    if disarm_try; then
+        log "disarmed after $DISARM_TRIES failed attempts: lid-close sleep enabled [SleepDisabled 0 confirmed]"
+        DISARM_TRIES=0
+        return
+    fi
+    DISARM_TRIES=$((DISARM_TRIES + 1))
+    if [ "$DISARM_TRIES" -ge $((DISARM_RETRIES + 1)) ]; then
+        log "disarm FAILED after $DISARM_RETRIES retries; giving up, sleep may STILL BE DISABLED: $SLEEP_ERR"
+        set_state idle
+        rm -f "$DEADLINE_FILE" 2>/dev/null
+        DISARM_TRIES=0
+    fi
+}
+
+# Daemon start: re-apply the flag for the recovered state. A failure is logged;
+# for 0 the daemon then retries like any failed disarm, for 1 it disarms (fail
+# safe: never stay "armed" without the flag).
+startup_sleep() {
+    if sleep_set "$1"; then
+        log "daemon start: SleepDisabled $1 confirmed"
+    else
+        log "daemon start: $SLEEP_ERR"
+        if [ "$1" -eq 0 ]; then DISARM_TRIES=1; else disarm; fi
+    fi
 }
 
 daemon() {
@@ -286,9 +371,9 @@ daemon() {
         disarm
     else
         case "$state" in
-            idle)   "$PMSET" -a disablesleep 0 ;;
-            armed)  "$PMSET" -a disablesleep 1 ;;
-            closed) if lid_closed; then "$PMSET" -a disablesleep 1; else disarm; fi ;;
+            idle)   startup_sleep 0 ;;
+            armed)  startup_sleep 1 ;;
+            closed) if lid_closed; then startup_sleep 1; else disarm; fi ;;
             *)      disarm ;;
         esac
     fi
@@ -297,6 +382,9 @@ daemon() {
     while true; do
         # sleep in background + wait, so TERM/INT is handled immediately
         sleep "$POLL" & wait $!
+
+        # a disarm failed: retry it (and nothing else) until it works or gives up
+        if [ "$DISARM_TRIES" -gt 0 ]; then retry_disarm; continue; fi
 
         state=$(get_state)
         if [ "$state" = idle ]; then fails=0; continue; fi
@@ -362,7 +450,8 @@ parse_args "$@"
 # "", `disarm` and `-l N` (N already canonicalized, no leading zeros).
 case "$MODE" in
     arm)     if [ -n "$LIMIT" ]; then need_root -l "$LIMIT"; else need_root; fi; arm ;;
-    disarm)  need_root disarm; disarm ;;
+    disarm)  need_root disarm
+             disarm || { echo "lidosd: could not re-enable sleep: $SLEEP_ERR (state left unchanged)" >&2; exit 1; } ;;
     status)  status ;;
     daemon)
         if [ "$(id -u)" -ne 0 ]; then

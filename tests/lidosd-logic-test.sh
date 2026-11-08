@@ -13,7 +13,8 @@
 # non-root caller sends to sudo (run as user nobody), the container check (exact
 # "true", failure, hang, a hang that ignores TERM), the limit (deadline file, status
 # text), and the daemon (container stops, transient failures, expiry, damaged or
-# expired deadline at startup, SIGTERM, lid closed).
+# expired deadline at startup, SIGTERM, lid closed), and pmset failures (a non-zero
+# exit, a read-back mismatch, the retries of a failed disarm, the start-up branches).
 # NOT covered (needs the real reinstall): real sudo and sudoers matching, launchd,
 # the real docker CLI, the real pmset.
 
@@ -43,11 +44,22 @@ mkfake() { /usr/bin/sed "s|@T@|$T|g" > "$T/$1"; chmod 755 "$T/$1"; }
 mkfake pmset <<'EOF'
 #!/bin/bash
 T=@T@
+# $T/pmset.mode: ok (default) | fail (every set exits 1) | lie (sets exit 0, the flag
+# does not change) | failn (the next N sets fail, N in $T/pmset.failsleft, then they work)
 echo "$*" >> "$T/pmset.log"
 case "$*" in
-    "-a disablesleep 1") echo 1 > "$T/sd" ;;
-    "-a disablesleep 0") echo 0 > "$T/sd" ;;
-    "-g")                echo "  SleepDisabled        $(cat "$T/sd" 2>/dev/null || echo 0)" ;;
+    "-a disablesleep 1"|"-a disablesleep 0")
+        case "$(cat "$T/pmset.mode" 2>/dev/null)" in
+            fail)  echo "pmset: failed to set the value" >&2; exit 1 ;;
+            lie)   exit 0 ;;
+            failn) left=$(cat "$T/pmset.failsleft" 2>/dev/null || echo 0)
+                   if [ "$left" -gt 0 ]; then
+                       echo $((left-1)) > "$T/pmset.failsleft"
+                       echo "pmset: failed to set the value" >&2; exit 1
+                   fi ;;
+        esac
+        case "$*" in *" 1") echo 1 > "$T/sd" ;; *) echo 0 > "$T/sd" ;; esac ;;
+    "-g")  echo "  SleepDisabled        $(cat "$T/sd" 2>/dev/null || echo 0)" ;;
 esac
 EOF
 
@@ -100,7 +112,7 @@ EOF
 LENV=( /usr/bin/env -u SUDO_USER LIDOSD_TEST=1 LIDOSD_OWNER_USER=llmtest
        LIDOSD_STATE_DIR="$S" LIDOSD_PMSET="$T/pmset" LIDOSD_IOREG="$T/ioreg"
        LIDOSD_SUDO="$T/sudo" LIDOSD_DOCKER="$T/docker" LIDOSD_CONTAINER=testbox
-       LIDOSD_POLL=1 LIDOSD_CHECK_TIMEOUT=1 )
+       LIDOSD_POLL=1 LIDOSD_CHECK_TIMEOUT=1 LIDOSD_DISARM_RETRIES=3 )
 L()  { "${LENV[@]}" "$T/lidosd" "$@"; }
 LN() { /usr/bin/sudo -u nobody "${LENV[@]}" "$T/lidosd" "$@"; }
 
@@ -149,6 +161,7 @@ reset() {
     : > "$T/pmset.log"; : > "$T/docker.calls"; : > "$T/sudo.calls"; : > "$T/daemon.log"
     echo 0 > "$T/sd"; echo open > "$T/lid"; echo true > "$T/docker.mode"
     echo exec > "$T/sudo.mode"; echo 0 > "$T/docker.count"
+    echo ok > "$T/pmset.mode"; echo 0 > "$T/pmset.failsleft"
 }
 
 begin() { printf '\n-- %s\n' "$1"; reset; f0=$fail; }
@@ -322,6 +335,120 @@ runrc L arm; startd
 echo hang > "$T/docker.mode"
 check "disarmed within 25 s" wait_state idle 25
 check "log: 3 consecutive checks" logged "not running (3 consecutive checks)"
+end_
+
+# ---------------------------------------------------------------------------
+section "6A. pmset failures (exit status and read-back are checked; a failed disarm is retried)"
+
+# wait_log TEXT SECONDS : daemon.log gets a line containing TEXT
+wait_log() {
+    local i=0
+    while [ "$i" -lt "$2" ]; do logged "$1" && return 0; sleep 1; i=$((i+1)); done
+    logged "$1"
+}
+# pm_count TEXT : number of daemon.log lines containing TEXT
+pm_count() { grep -cF -- "$1" "$T/daemon.log"; }
+
+begin "6A.1 arm: pmset exits non-zero"
+echo fail > "$T/pmset.mode"
+out=$(L arm 2>"$T/err"); rc=$?
+check   "exit 1" [ "$rc" -eq 1 ]
+check   "stderr names the failure" grep -qF "could not disable lid-close sleep: pmset -a disablesleep 1 failed (exit 1)" "$T/err"
+check   "log: arm failed, with the exit status and pmset's message" grep -qF "arm failed: pmset -a disablesleep 1 failed (exit 1): pmset: failed to set the value" <<<"$out"
+check   "log: the undo failed too" grep -qF "arm undo failed:" <<<"$out"
+nocheck "no 'armed:' success line" grep -qF "armed:" <<<"$out"
+check   "state is idle" [ "$(state)" = idle ]
+nocheck "no deadline left" dl_exists
+end_
+
+begin "6A.2 arm: pmset exits 0 but the flag does not change"
+echo lie > "$T/pmset.mode"
+out=$(L arm -l 5 2>"$T/err"); rc=$?
+check   "exit 1" [ "$rc" -eq 1 ]
+check   "log: the read-back mismatch" grep -qF "exited 0 but SleepDisabled reads '0'" <<<"$out"
+check   "log: the undo is confirmed" grep -qF "arm undone: SleepDisabled 0 confirmed" <<<"$out"
+check   "state is idle" [ "$(state)" = idle ]
+nocheck "no deadline left (the -l 5 was undone)" dl_exists
+end_
+
+begin "6A.3 arm succeeds: the verified result is logged, no error"
+out=$(L arm 2>&1); rc=$?
+check   "exit 0" [ "$rc" -eq 0 ]
+check   "log: [SleepDisabled 1 confirmed]" grep -qF "[SleepDisabled 1 confirmed]" <<<"$out"
+nocheck "no failure text" grep -qF "failed" <<<"$out"
+check   "state armed, flag 1" [ "$(state)-$(sd)" = armed-1 ]
+end_
+
+begin "6A.4 disarm (command line): pmset fails"
+runrc L arm
+check   "armed first" [ "$(state)" = armed ]
+echo fail > "$T/pmset.mode"
+out=$(L disarm 2>"$T/err"); rc=$?
+check   "exit 1" [ "$rc" -eq 1 ]
+check   "state left as armed" [ "$(state)" = armed ]
+check   "log: disarm failed, with the exit status" grep -qF "disarm failed: pmset -a disablesleep 0 failed (exit 1)" <<<"$out"
+check   "stderr: state left unchanged" grep -qF "(state left unchanged)" "$T/err"
+nocheck "no 'disarmed:' line" grep -qF "disarmed:" <<<"$out"
+end_
+
+begin "6A.5 disarm (command line) succeeds: confirmed in the log"
+runrc L arm
+out=$(L disarm 2>&1); rc=$?
+check   "exit 0" [ "$rc" -eq 0 ]
+check   "log: [SleepDisabled 0 confirmed]" grep -qF "disarmed: lid-close sleep enabled [SleepDisabled 0 confirmed]" <<<"$out"
+check   "state idle, flag 0" [ "$(state)-$(sd)" = idle-0 ]
+end_
+
+begin "6A.6 daemon: a disarm keeps failing, then it gives up (3 retries in the test)"
+runrc L arm; startd
+echo fail > "$T/pmset.mode"; echo false > "$T/docker.mode"
+check   "the final failure is logged within 20 s" wait_log "giving up" 20
+check   "log: sleep may STILL BE DISABLED" logged "giving up, sleep may STILL BE DISABLED"
+check   "exactly two error lines (the first failure and the final one; retries are silent)" [ "$(pm_count "disablesleep 0 failed")" -eq 2 ]
+check   "exactly one 'disarm failed:' line" [ "$(pm_count "disarm failed:")" -eq 1 ]
+check   "state is idle after giving up" [ "$(state)" = idle ]
+check   "the flag is still 1 (every set failed)" [ "$(sd)" = 1 ]
+end_
+
+begin "6A.7 daemon: a disarm fails twice, then works"
+runrc L arm; startd
+echo failn > "$T/pmset.mode"; echo 2 > "$T/pmset.failsleft"; echo false > "$T/docker.mode"
+check   "idle within 20 s" wait_state idle 20
+check   "log: disarmed after 2 failed attempts" wait_log "disarmed after 2 failed attempts" 5
+check   "log: confirmed" logged "[SleepDisabled 0 confirmed]"
+check   "exactly one 'disarm failed:' line" [ "$(pm_count "disarm failed:")" -eq 1 ]
+nocheck "it did not give up" logged "giving up"
+check   "the flag is 0" [ "$(sd)" = 0 ]
+end_
+
+begin "6A.8 daemon start, state idle: pmset fails, then recovers"
+echo failn > "$T/pmset.mode"; echo 2 > "$T/pmset.failsleft"
+startd
+check   "log: the start failure, with the exit status" wait_log "daemon start: pmset -a disablesleep 0 failed (exit 1)" 5
+check   "log: disarmed after 2 failed attempts (the retries)" wait_log "disarmed after 2 failed attempts" 8
+nocheck "it did not give up" logged "giving up"
+check   "the flag is 0, state idle" [ "$(state)-$(sd)" = idle-0 ]
+end_
+
+begin "6A.9 daemon start, state armed: pmset cannot re-apply the flag"
+runrc L arm
+echo failn > "$T/pmset.mode"; echo 2 > "$T/pmset.failsleft"
+startd
+check   "log: the start failure" wait_log "daemon start: pmset -a disablesleep 1 failed (exit 1)" 5
+check   "log: the fail-safe disarm failed too" wait_log "disarm failed: pmset -a disablesleep 0 failed (exit 1)" 5
+check   "log: disarmed after 1 failed attempt" wait_log "disarmed after 1 failed attempts" 8
+check   "state idle, flag 0" [ "$(state)-$(sd)" = idle-0 ]
+end_
+
+begin "6A.10 daemon start with a healthy pmset: confirmed lines, no failures"
+runrc L arm; startd
+check   "armed: log says SleepDisabled 1 confirmed" logged "daemon start: SleepDisabled 1 confirmed"
+nocheck "no failure line" logged "failed"
+stop_daemon
+reset
+startd
+check   "idle: log says SleepDisabled 0 confirmed" logged "daemon start: SleepDisabled 0 confirmed"
+nocheck "no failure line" logged "failed"
 end_
 
 # ---------------------------------------------------------------------------

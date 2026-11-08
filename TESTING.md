@@ -8,9 +8,10 @@ There are three layers:
 2. **Sudoers-check tests** (`tests/sudoers-check-test.sh`, see "Sudoers-check tests" at the
    end): automated, no root needed; they test how `install.sh` validates the staged
    `lidosd.sudoers` and the `MAX_LIMIT` agreement.
-3. **Functional tests** (`INSTALL.md`, items 1 to 11): run by hand on the installed system.
-   Items 5 to 8 were written around the Desktop app process and are to be rewritten for the
-   container check; a new item that arms with `-l 1` and watches the disarm is planned.
+3. **Functional tests** (`INSTALL.md`, items 1 to 16): run by hand on the installed system.
+   Items 7, 8 and 11 to 15 cover the container check, the sudoers refusals and the `-l`
+   limit; item 16 checks the `pmset` read-back lines in the log. Items 7, 8 and 11 to 16 were
+   written from the scripts and have not been run yet (they wait for the real reinstall).
 
 The logic tests cover what can be proven without the real system. Real `sudo`/sudoers
 matching, launchd, the real `docker` CLI and the real `pmset` are only exercised by the
@@ -22,7 +23,8 @@ functional tests after a real install.
 sudo /bin/bash tests/lidosd-logic-test.sh [PATH-TO-lidosd]
 ```
 
-- Run as root: `lidosd` insists on a root-owned state directory. Takes about 1 to 2 minutes.
+- Run as root: `lidosd` insists on a root-owned state directory. Takes a few minutes (the
+  daemon scenarios wait on real polling).
 - Without an argument it tests the repo's `lidosd` (the file one level above `tests/`,
   found from the script's own location); pass a path to test another copy.
 - Output is one `PASS`/`FAIL` line per check and a final count. Exit status is 0 only if
@@ -40,17 +42,23 @@ coming through `sudo` can never turn it on; the test script therefore runs `lido
 
 | Hook | Replaced by |
 |---|---|
-| `LIDOSD_PMSET` | fake `pmset`: logs its arguments, keeps a `SleepDisabled` flag |
+| `LIDOSD_PMSET` | fake `pmset`: logs its arguments, keeps a `SleepDisabled` flag, and can fail, lie or fail a set number of times (modes below) |
 | `LIDOSD_IOREG` | fake `ioreg`: reports the lid open or closed from a file |
 | `LIDOSD_SUDO` | fake `sudo`: `exec` mode drops `-n -u USER -H` and runs the command; `log` mode only records its arguments |
 | `LIDOSD_DOCKER` | fake `docker`, behavior set from a file (see below) |
 | `LIDOSD_CONTAINER`, `LIDOSD_OWNER_USER` | `testbox`, `llmtest` |
 | `LIDOSD_STATE_DIR` | the scratch state directory |
 | `LIDOSD_POLL`, `LIDOSD_CHECK_TIMEOUT` | 1 s each, so the daemon scenarios run quickly |
+| `LIDOSD_DISARM_RETRIES` | 3 (the real value is 12), so the give-up scenario is short |
 
 The fake `docker` modes: `true`, `false`, `fail` (error exit), `junk` (`true x`), `hang`
 (sleeps), `hangterm` (hangs and ignores TERM, so only `kill -9` ends it) and `flaky` (two
 `false` answers, then `true`).
+
+The fake `pmset` modes (the file `pmset.mode`; they apply to the `disablesleep` sets only,
+and `pmset -g` always answers): `ok` (default), `fail` (every set exits 1 with a message),
+`lie` (a set exits 0 but the flag does not change, so only the read-back catches it) and
+`failn` (the next N sets fail, N from the file `pmset.failsleft`, then they work).
 
 ### Safety guards
 
@@ -62,7 +70,7 @@ The fake `docker` modes: `true`, `false`, `fail` (error exit), `junk` (`true x`)
   Arming the live daemon while the tests run makes that check fail, legitimately.
 - The scratch tree is removed on success and kept on failure.
 
-### What it covers (111 checks)
+### What it covers (160 checks)
 
 | Section | Checks | What is checked |
 |---|---|---|
@@ -73,6 +81,7 @@ The fake `docker` modes: `true`, `false`, `fail` (error exit), `junk` (`true x`)
 | 4. Limit | 14 | `-l 1`, `-l 05` and `--limit=0010` write a deadline about 60, 300 and 600 s ahead (leading zeros canonicalized) and `status` shows the minutes left. `-l 0` and a plain `lidosd` clear the limit. A refused re-arm leaves the old deadline untouched. `disarm` returns to idle, re-enables sleep and removes the deadline. |
 | 5. Status | 5 | No `limit:` line when idle. A garbage, 14-digit or symlink deadline shows `invalid`; a past deadline shows `expired`. |
 | 6. Daemon | 32 | See the list below. |
+| 6A. `pmset` failures | 49 | See the list below. |
 | 7. Sudo arguments | 21 | Run as user `nobody` with the fake `sudo` in `log` mode. Every accepted spelling reaches sudo in a canonical form: nothing, `disarm` or `-l N` (for example `arm -l 05` becomes `-l 5`, `--limit=0010` becomes `-l 10`, `-l5` becomes `-l 5`, `-l 0000` becomes `-l 0`, `-l 1440` stays). Invalid input (`-l 1441`, `-l 00005`, `disarm -l 5`, `-l`, `-l x`) exits 2 with no sudo call. These are the forms the sudoers patterns must match. |
 | 8. Live system | 2 | The live state files and `SleepDisabled` are unchanged. |
 
@@ -87,17 +96,35 @@ Daemon scenarios (section 6, poll 1 s):
 - 6.7 The limit runs out while the lid is closed (state `closed`).
 - 6.8 A hung container check counts as a failure and leads to a disarm.
 
+`pmset` failure scenarios (section 6A; every `disablesleep` set is checked by exit status and
+read back with `pmset -g`; the first five use the command line, the rest the daemon):
+
+- 6A.1 `arm` with `pmset` exiting 1: exit 1, an `arm failed:` line with the exit status and `pmset`'s message, the undo also fails (`arm undo failed:`), state idle, no deadline, no `armed:` line.
+- 6A.2 `arm -l 5` with `pmset` exiting 0 but the flag unchanged (`lie`): the read-back mismatch is logged, then `arm undone: SleepDisabled 0 confirmed`; state idle, deadline removed.
+- 6A.3 A healthy `arm`: the log line ends in `[SleepDisabled 1 confirmed]` and there is no `failed` text.
+- 6A.4 `disarm` with `pmset` failing: exit 1, state left `armed`, `disarm failed:` logged, `(state left unchanged)` on stderr, no `disarmed:` line.
+- 6A.5 A healthy `disarm`: `[SleepDisabled 0 confirmed]`, state idle, flag 0.
+- 6A.6 The daemon's disarm keeps failing (3 retries in the test): exactly two error lines (the first failure and the final one; the retries are silent), then `giving up, sleep may STILL BE DISABLED`; state idle, flag still 1.
+- 6A.7 The daemon's disarm fails twice, then works: `disarmed after 2 failed attempts`, one `disarm failed:` line, no give-up.
+- 6A.8 Daemon start in state idle with the first two sets failing: the start failure is logged with the exit status, then the retries succeed.
+- 6A.9 Daemon start in state armed with the flag not re-applied: the start failure, the fail-safe disarm (which also fails once), then success after one retry; state idle.
+- 6A.10 Daemon start with a healthy `pmset`, in state armed and in state idle: `daemon start: SleepDisabled N confirmed` and no failure line.
+
 ### Not covered
 
 - Real `sudo` and sudoers matching (section 7 shows what `lidosd` sends, not that sudo accepts it).
 - launchd and the daemon's real start, and the real `docker` CLI under the daemon.
-- The real `pmset` (including the exit status work in item (e)).
+- The real `pmset`: its real exit status and messages on failure, and whether `pmset -g`
+  shows a change at once (the read-back after each set). Only the reinstall shows these
+  (`INSTALL.md` item 16).
 - Behavior under load or across a reboot.
 
 ### Last recorded run
 
-2026-11-06, run by the user as `sudo /bin/bash` on the Monterey Mac: **111 passed, 0 failed**.
-This was after the container check (d1) and the `-l|--limit` option (d2) were committed.
+2026-11-07, run by the user as `sudo /bin/bash` on the Monterey Mac: **160 passed, 0 failed**
+(the 111 earlier checks plus the 49 of section 6A), after the `pmset` exit-status and
+read-back work (e). Before that, 2026-11-06: 111 passed, 0 failed, after the container check
+(d1) and the `-l|--limit` option (d2) were committed.
 
 ### Changing the tests
 
