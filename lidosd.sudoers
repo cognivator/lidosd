@@ -1,0 +1,21 @@
+# /etc/sudoers.d/lidosd  (mode 440, root:wheel)
+# TEMPLATE: install.sh substitutes the group name (--group) and installs the result.
+# Lets members of group @@SLEEP_GROUP@@ arm / disarm the lid-close OSD without a password.
+# Allowed forms only: `lidosd` (no arguments, = arm), `lidosd disarm`, `lidosd -l N`
+# with N from 0 to 1440 and no leading zeros. Never allow bare `lidosd` with other
+# arguments (that would expose `daemon`). The script re-validates its arguments as
+# root; this file is only a coarse gate. The top number pattern (1440) must match
+# MAX_LIMIT in lidosd (install.sh checks this).
+#
+# Validate the substituted (staged) copy that install.sh writes: `visudo -cf` on
+# this template parses OK (observed 2026-11-05) but proves nothing about the group.
+Cmnd_Alias LIDOSD_CMDS = \
+    /Library/PrivilegedHelperTools/lidosd "", \
+    /Library/PrivilegedHelperTools/lidosd disarm, \
+    /Library/PrivilegedHelperTools/lidosd -l [0-9], \
+    /Library/PrivilegedHelperTools/lidosd -l [1-9][0-9], \
+    /Library/PrivilegedHelperTools/lidosd -l [1-9][0-9][0-9], \
+    /Library/PrivilegedHelperTools/lidosd -l 1[0-3][0-9][0-9], \
+    /Library/PrivilegedHelperTools/lidosd -l 14[0-3][0-9], \
+    /Library/PrivilegedHelperTools/lidosd -l 1440
+%@@SLEEP_GROUP@@ ALL=(root) NOPASSWD: LIDOSD_CMDS

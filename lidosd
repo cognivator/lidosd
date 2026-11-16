@@ -1,0 +1,463 @@
+#!/bin/bash
+# lidosd - One-Shot Disable (OSD) of lid-close sleep for macOS (Monterey, Intel)
+#
+# Usage:
+#   lidosd           arm the OSD: lid-close sleep is disabled until the lid has
+#                    been closed and then reopened (auto re-enable), until
+#                    `lidosd disarm` is run, or until the AnythingLLM container
+#                    stops - whichever happens first
+#   lidosd [arm] -l MINUTES    (also: --limit=MINUTES, --limit MINUTES, -lMINUTES)
+#                    as above, and also disarm after MINUTES (0 to 1440; 0 or no
+#                    -l means no limit). The clock starts at arm; a re-arm with
+#                    -l replaces the limit and a plain `lidosd` clears it. If the
+#                    lid is closed when the limit ends, the Mac then sleeps and
+#                    the service drops until someone opens the lid.
+#   lidosd disarm    re-enable lid-close sleep immediately
+#   lidosd status    show state, lid position, time left on a limit, SleepDisabled flag
+#   lidosd daemon    internal: watcher loop run by launchd as root
+#
+# Mechanism
+#   * Lid-close sleep is suppressed with `pmset -a disablesleep 1` (root only).
+#     This blocks ALL sleep, not only lid-close, so it is held only while armed.
+#   * A root LaunchDaemon polls every POLL seconds (5) and runs a small state
+#     machine persisted in /var/db/lidosd/state:
+#
+#        idle --(lidosd)--> armed --(lid closes)--> closed --(lid opens)--> idle
+#                             |                        |
+#                             +--(lidosd disarm)-------+--> idle
+#                             +--(container stops)-----+--> idle
+#                             +--(limit reached)-------+--> idle
+#
+#     Lid position comes from IOKit AppleClamshellState (Yes = closed).
+#     On every transition to idle, `pmset -a disablesleep 0` is applied.
+#   * Every `pmset ... disablesleep` call is checked (exit status) and the flag is
+#     read back with `pmset -g`: failures are logged with a timestamp, a verified
+#     result is logged as "SleepDisabled N confirmed". A failed disarm in the
+#     daemon is retried on each poll, up to DISARM_RETRIES times (about 1 min),
+#     then logged as a final failure and the state is set to idle.
+#   * "Container" = the Docker container CONTAINER, asked as OWNER_USER with
+#     `sudo -u OWNER_USER -H docker inspect` (the same check as
+#     anythingllm-caffeinate.sh). Arming is refused if the first check fails;
+#     while armed or closed, FAIL_LIMIT consecutive failed checks disarm.
+#   * Limit (optional): the deadline (epoch seconds) is kept in its own root-owned
+#     file /var/db/lidosd/deadline, written before the state. The daemon disarms
+#     when it passes, and also when the file exists but is unreadable or not a
+#     number (fail safe). A missing file means no limit. Every transition to
+#     idle removes it.
+#
+# Security (this script runs as root, and OWNER_USER can reach it through sudo)
+#   * PATH and umask are fixed; every external tool is called by absolute path
+#     or from the fixed PATH.
+#   * Constants are fixed in this file. Environment variables are NOT consulted,
+#     except in test mode (LIDOSD_TEST=1), which is ignored whenever sudo started
+#     the process (SUDO_USER set) and so cannot be turned on by an unprivileged
+#     caller.
+#   * An unprivileged caller is re-executed through `sudo -n` on the FIXED path
+#     /Library/PrivilegedHelperTools/lidosd with canonical arguments (never $0 / caller input).
+#     See lidosd.sudoers, which allows only `lidosd`, `lidosd disarm` and
+#     `lidosd -l N` (N from 0 to MAX_LIMIT, no leading zeros).
+#     Arguments are parsed strictly (parse_args), at the caller and again as
+#     root, because sudoers is only a coarse gate: arm | disarm | status | daemon,
+#     and -l only with arm.
+#   * The container check runs as OWNER_USER (`sudo -n -u OWNER_USER -H`, absolute
+#     docker path, bounded by CHECK_TIMEOUT). Its answer is untrusted: only the
+#     exact text "true" counts, and an error or a hang counts as not running.
+#     That account controls its own docker config, so the check gates stale
+#     arms; it does not bound a caller that wants to stay armed.
+#   * The state directory must be a real directory owned by root and not
+#     group/other-writable; otherwise lidosd refuses to read or write state.
+#     A missing, unreadable or unrecognized state fails safe to "disarm".
+#
+# Polling trade-off: a lid close+reopen faster than POLL seconds can be missed;
+# the OSD then simply stays armed until the next observed close/reopen, or
+# `lidosd disarm`, or the container stops.
+#
+# Install as root-owned, mode 755, in a root-owned directory (/Library/PrivilegedHelperTools);
+# install.sh checks this.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 022
+set -u
+
+# ---- constants. Keep OWNER_USER / DOCKER / CONTAINER in sync with
+# ---- anythingllm-caffeinate.sh, lidosd.sudoers and install.sh (install.sh
+# ---- checks OWNER_USER).
+OWNER_USER=llmserver
+DOCKER=/usr/local/bin/docker
+CONTAINER=anythingllm
+SELF=/Library/PrivilegedHelperTools/lidosd
+SUDO=/usr/bin/sudo
+PMSET=/usr/bin/pmset
+IOREG=/usr/sbin/ioreg
+STATE_DIR=/var/db/lidosd
+POLL=5
+CHECK_TIMEOUT=4     # seconds before a container check is killed
+FAIL_LIMIT=3        # consecutive failed checks (armed or closed) before disarm
+MAX_LIMIT=1440      # largest `-l MINUTES` (24 h); keep in sync with the top pattern in lidosd.sudoers
+DISARM_RETRIES=12   # retries (one per POLL, about 1 min) after a failed disarm, then give up
+DISARM_TRIES=0      # failed disarm attempts so far; 0 = none pending (the daemon retries while > 0)
+SLEEP_ERR=          # reason for the last failed sleep_set
+SKIP_ROOT=0
+
+# ---- test mode (never honored under sudo)
+if [ "${LIDOSD_TEST:-}" = 1 ] && [ -z "${SUDO_USER:-}" ]; then
+    OWNER_USER=${LIDOSD_OWNER_USER:-$OWNER_USER}
+    DOCKER=${LIDOSD_DOCKER:-$DOCKER}
+    CONTAINER=${LIDOSD_CONTAINER:-$CONTAINER}
+    SUDO=${LIDOSD_SUDO:-$SUDO}
+    PMSET=${LIDOSD_PMSET:-$PMSET}
+    IOREG=${LIDOSD_IOREG:-$IOREG}
+    STATE_DIR=${LIDOSD_STATE_DIR:-$STATE_DIR}
+    POLL=${LIDOSD_POLL:-$POLL}
+    CHECK_TIMEOUT=${LIDOSD_CHECK_TIMEOUT:-$CHECK_TIMEOUT}
+    SKIP_ROOT=${LIDOSD_SKIP_ROOT:-0}
+    DISARM_RETRIES=${LIDOSD_DISARM_RETRIES:-$DISARM_RETRIES}
+fi
+STATE_FILE="$STATE_DIR/state"
+DEADLINE_FILE="$STATE_DIR/deadline"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') lidosd: $*"; }
+
+usage() {
+    echo "usage: lidosd [arm] [-l MINUTES | --limit=MINUTES] | disarm | status" >&2
+    echo "       MINUTES is 0 to $MAX_LIMIT; 0 or no -l means no limit" >&2
+    exit 2
+}
+
+# Strict parsing: sudo joins arguments with spaces and sudoers is only a coarse
+# gate, so the script validates for itself, at the caller and again as root.
+# set_limit VALUE : digits only, at most 4 of them, 0..MAX_LIMIT, given once.
+# Leading zeros are canonicalized with 10# (05 -> 5, 0000 -> 0).
+set_limit() {
+    [ -z "$LIMIT" ] || usage
+    case "$1" in ''|*[!0-9]*) usage ;; esac
+    [ ${#1} -le 4 ] || usage
+    LIMIT=$((10#$1))
+    [ "$LIMIT" -le "$MAX_LIMIT" ] || usage
+}
+
+# parse_args ARGS... : sets MODE (arm|disarm|status|daemon) and LIMIT (empty = not given).
+# Accepts: [arm] [-l N | -lN | --limit N | --limit=N], in any order. A limit is
+# valid only with arm.
+parse_args() {
+    MODE=
+    LIMIT=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            arm|disarm|status|daemon) [ -z "$MODE" ] || usage; MODE=$1 ;;
+            -l|--limit)               [ $# -ge 2 ] || usage; set_limit "$2"; shift ;;
+            --limit=*)                set_limit "${1#--limit=}" ;;
+            -l?*)                     set_limit "${1#-l}" ;;
+            *)                        usage ;;
+        esac
+        shift
+    done
+    [ -n "$MODE" ] || MODE=arm
+    if [ -n "$LIMIT" ] && [ "$MODE" != arm ]; then usage; fi
+}
+
+# need_root [ARGS...] : if not root, re-exec through sudo with a fixed path and
+# canonical arguments (so sudoers matches exactly); otherwise continue.
+need_root() {
+    if [ "$(id -u)" -ne 0 ] && [ "$SKIP_ROOT" != 1 ]; then
+        exec "$SUDO" -n "$SELF" "$@"
+    fi
+}
+
+lid_closed() {
+    "$IOREG" -r -k AppleClamshellState -d 4 2>/dev/null \
+        | grep -q 'AppleClamshellState" = Yes'
+}
+
+# True only if `docker inspect`, run AS $OWNER_USER, prints exactly "true".
+# The answer is untrusted (that account controls its own docker config), so
+# anything else, a failure, or a call outliving CHECK_TIMEOUT counts as not
+# running. macOS has no timeout(1): a background watchdog kills the call.
+container_running() {
+    local out
+    out=$(
+        "$SUDO" -n -u "$OWNER_USER" -H "$DOCKER" inspect \
+            --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null &
+        cpid=$!
+        ( sleep "$CHECK_TIMEOUT"; kill "$cpid" 2>/dev/null
+          sleep 1; kill -9 "$cpid" 2>/dev/null ) >/dev/null 2>&1 &
+        wpid=$!
+        wait "$cpid" 2>/dev/null
+        kill "$wpid" 2>/dev/null
+    )
+    [ "$out" = true ]
+}
+
+ensure_state_dir() {
+    if [ ! -e "$STATE_DIR" ]; then
+        mkdir -p "$STATE_DIR" && chmod 755 "$STATE_DIR" || return 1
+    fi
+    if [ -L "$STATE_DIR" ] || [ ! -d "$STATE_DIR" ] \
+       || [ -z "$(find "$STATE_DIR" -maxdepth 0 -user root 2>/dev/null)" ] \
+       || [ -n "$(find "$STATE_DIR" -maxdepth 0 \( -perm -020 -o -perm -002 \) 2>/dev/null)" ]; then
+        echo "lidosd: unsafe state directory $STATE_DIR (must be a real directory owned by root, not group/other-writable)" >&2
+        return 1
+    fi
+}
+
+# idle | armed | closed | invalid ; a missing file means idle
+get_state() {
+    local s
+    if [ -L "$STATE_FILE" ]; then echo invalid; return; fi
+    if [ ! -e "$STATE_FILE" ]; then echo idle; return; fi
+    s=$(cat "$STATE_FILE" 2>/dev/null) || { echo invalid; return; }
+    case "$s" in
+        idle|armed|closed) echo "$s" ;;
+        *)                 echo invalid ;;
+    esac
+}
+
+set_state() {
+    ensure_state_dir || return 1
+    rm -f "$STATE_FILE.tmp"
+    ( set -C; printf '%s\n' "$1" > "$STATE_FILE.tmp" ) && mv -f "$STATE_FILE.tmp" "$STATE_FILE" \
+        && chmod 644 "$STATE_FILE"
+}
+
+# The optional limit is a deadline (epoch seconds) in its own root-owned file
+# beside the state file, so get_state and its fail-safe are unchanged.
+# deadline_left prints: none (no file) | invalid | SECONDS_LEFT (<= 0 once expired)
+deadline_left() {
+    local d
+    if [ -L "$DEADLINE_FILE" ]; then echo invalid; return; fi
+    if [ ! -e "$DEADLINE_FILE" ]; then echo none; return; fi
+    d=$(cat "$DEADLINE_FILE" 2>/dev/null) || { echo invalid; return; }
+    case "$d" in ''|*[!0-9]*) echo invalid; return ;; esac
+    [ ${#d} -le 12 ] || { echo invalid; return; }
+    echo $(( 10#$d - $(date +%s) ))
+}
+
+# True when the limit has expired or the deadline file is unreadable (fail safe).
+limit_hit() {
+    local left
+    left=$(deadline_left)
+    case "$left" in
+        none)    return 1 ;;
+        invalid) return 0 ;;
+        *)       [ "$left" -le 0 ] ;;
+    esac
+}
+
+# set_deadline MINUTES : the clock starts now; 0 clears the limit.
+set_deadline() {
+    ensure_state_dir || return 1
+    rm -f "$DEADLINE_FILE.tmp"
+    if [ "$1" -eq 0 ]; then rm -f "$DEADLINE_FILE" || return 1; return 0; fi
+    ( set -C; printf '%s\n' "$(( $(date +%s) + $1 * 60 ))" > "$DEADLINE_FILE.tmp" ) \
+        && mv -f "$DEADLINE_FILE.tmp" "$DEADLINE_FILE" && chmod 644 "$DEADLINE_FILE"
+}
+
+# sleep_disabled : the flag as pmset reports it (1, 0, or empty if unreadable)
+sleep_disabled() { "$PMSET" -g 2>/dev/null | awk '/SleepDisabled/ {print $2}'; }
+
+# sleep_set N : `pmset -a disablesleep N`, then read the flag back. Silent; on
+# failure it sets SLEEP_ERR (the exit status and pmset's message, or the
+# mismatch) and returns 1. Callers decide what to log.
+sleep_set() {
+    local want=$1 out rc got nl=$'\n'
+    SLEEP_ERR=
+    out=$("$PMSET" -a disablesleep "$want" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        SLEEP_ERR="pmset -a disablesleep $want failed (exit $rc): ${out//"$nl"/ }"
+        return 1
+    fi
+    got=$(sleep_disabled)
+    if [ "$got" != "$want" ]; then
+        SLEEP_ERR="pmset -a disablesleep $want exited 0 but SleepDisabled reads '${got:-unreadable}'"
+        return 1
+    fi
+    return 0
+}
+
+arm() {
+    if ! container_running; then
+        echo "lidosd: container $CONTAINER is not running (checked as $OWNER_USER); not arming." >&2
+        exit 1
+    fi
+    # The deadline is written BEFORE the state, so the daemon never sees "armed"
+    # without the limit that was asked for. -l 0 or no -l clears any old limit.
+    set_deadline "${LIMIT:-0}" || exit 1
+    set_state armed || exit 1
+    if ! sleep_set 1; then
+        log "arm failed: $SLEEP_ERR"
+        echo "lidosd: could not disable lid-close sleep: $SLEEP_ERR" >&2
+        # undo, so a half-armed state is not left behind
+        if sleep_set 0; then
+            log "arm undone: SleepDisabled 0 confirmed"
+        else
+            log "arm undo failed: $SLEEP_ERR"
+        fi
+        set_state idle
+        rm -f "$DEADLINE_FILE" 2>/dev/null
+        exit 1
+    fi
+    local note=
+    [ "${LIMIT:-0}" -gt 0 ] && note=", limit $LIMIT min"
+    log "armed: lid-close sleep disabled until lid closes and reopens (or container stops)$note [SleepDisabled 1 confirmed]"
+    if lid_closed; then
+        echo "Note: lid is already closed; the Mac may have slept or be in clamshell mode." >&2
+    fi
+}
+
+# disarm_try : re-enable sleep FIRST and verify it; recording the state is best
+# effort. On success: state idle, limit cleared. On failure: return 1 with
+# SLEEP_ERR set and the state untouched.
+disarm_try() {
+    sleep_set 0 || return 1
+    set_state idle || echo "lidosd: warning: could not record state 'idle'" >&2
+    rm -f "$DEADLINE_FILE" 2>/dev/null     # every transition to idle clears the limit
+    return 0
+}
+
+disarm() {
+    if disarm_try; then
+        log "disarmed: lid-close sleep enabled [SleepDisabled 0 confirmed]"
+        DISARM_TRIES=0
+        return 0
+    fi
+    log "disarm failed: $SLEEP_ERR"
+    DISARM_TRIES=1          # the daemon retries on each poll; the command line just exits 1
+    return 1
+}
+
+# Daemon only: called on each poll while DISARM_TRIES > 0 (a disarm failed).
+# Silent until it works or gives up; disarm() logged the first failure.
+retry_disarm() {
+    if disarm_try; then
+        log "disarmed after $DISARM_TRIES failed attempts: lid-close sleep enabled [SleepDisabled 0 confirmed]"
+        DISARM_TRIES=0
+        return
+    fi
+    DISARM_TRIES=$((DISARM_TRIES + 1))
+    if [ "$DISARM_TRIES" -ge $((DISARM_RETRIES + 1)) ]; then
+        log "disarm FAILED after $DISARM_RETRIES retries; giving up, sleep may STILL BE DISABLED: $SLEEP_ERR"
+        set_state idle
+        rm -f "$DEADLINE_FILE" 2>/dev/null
+        DISARM_TRIES=0
+    fi
+}
+
+# Daemon start: re-apply the flag for the recovered state. A failure is logged;
+# for 0 the daemon then retries like any failed disarm, for 1 it disarms (fail
+# safe: never stay "armed" without the flag).
+startup_sleep() {
+    if sleep_set "$1"; then
+        log "daemon start: SleepDisabled $1 confirmed"
+    else
+        log "daemon start: $SLEEP_ERR"
+        if [ "$1" -eq 0 ]; then DISARM_TRIES=1; else disarm; fi
+    fi
+}
+
+daemon() {
+    local state fails=0
+    trap 'disarm; exit 0' TERM INT
+
+    # Reconcile after a (re)start so a crash cannot leave sleep disabled forever.
+    # One failed check is enough here: a failure fails safe to disarm. The limit
+    # is checked first: it needs no sudo call.
+    state=$(get_state)
+    if [ "$state" != idle ] && limit_hit; then
+        log "limit reached (or deadline file invalid) at startup; disarming"
+        disarm
+    elif [ "$state" != idle ] && ! container_running; then
+        log "container $CONTAINER (as $OWNER_USER) not running at startup"
+        disarm
+    else
+        case "$state" in
+            idle)   startup_sleep 0 ;;
+            armed)  startup_sleep 1 ;;
+            closed) if lid_closed; then startup_sleep 1; else disarm; fi ;;
+            *)      disarm ;;
+        esac
+    fi
+    log "daemon started (poll=${POLL}s), state=$(get_state)"
+
+    while true; do
+        # sleep in background + wait, so TERM/INT is handled immediately
+        sleep "$POLL" & wait $!
+
+        # a disarm failed: retry it (and nothing else) until it works or gives up
+        if [ "$DISARM_TRIES" -gt 0 ]; then retry_disarm; continue; fi
+
+        state=$(get_state)
+        if [ "$state" = idle ]; then fails=0; continue; fi
+
+        if [ "$state" = invalid ]; then
+            log "unreadable or unrecognized state; failing safe"
+            fails=0
+            disarm
+            continue
+        fi
+
+        # armed or closed: the limit first (no sudo call), then the container
+        if limit_hit; then
+            log "limit reached (or deadline file invalid); disarming"
+            fails=0
+            disarm
+            continue
+        fi
+
+        # a hung or failed check counts; FAIL_LIMIT in a row disarm
+        if container_running; then
+            fails=0
+        else
+            fails=$((fails + 1))
+            if [ "$fails" -lt "$FAIL_LIMIT" ]; then continue; fi
+            log "container $CONTAINER (as $OWNER_USER) not running ($fails consecutive checks)"
+            fails=0
+            disarm
+            continue
+        fi
+
+        case "$state" in
+            armed)  if lid_closed; then set_state closed && log "lid closed while armed"; fi ;;
+            closed) if ! lid_closed; then log "lid reopened"; disarm; fi ;;
+        esac
+    done
+}
+
+status() {
+    local s left
+    s=$(get_state)
+    echo "state:         $s"
+    echo "lid:           $(lid_closed && echo closed || echo open)"
+    echo "container:     checked by the daemon while armed"
+    if [ "$s" = armed ] || [ "$s" = closed ]; then
+        left=$(deadline_left)
+        case "$left" in
+            none)    echo "limit:         none" ;;
+            invalid) echo "limit:         invalid (the daemon will disarm)" ;;
+            *)       if [ "$left" -le 0 ]; then
+                         echo "limit:         expired (the daemon will disarm)"
+                     else
+                         echo "limit:         $(( (left + 59) / 60 )) min left"
+                     fi ;;
+        esac
+    fi
+    echo "SleepDisabled: $("$PMSET" -g 2>/dev/null | awk '/SleepDisabled/ {print $2}')"
+}
+
+parse_args "$@"
+
+# The re-exec through sudo uses only the canonical forms sudoers allows:
+# "", `disarm` and `-l N` (N already canonicalized, no leading zeros).
+case "$MODE" in
+    arm)     if [ -n "$LIMIT" ]; then need_root -l "$LIMIT"; else need_root; fi; arm ;;
+    disarm)  need_root disarm
+             disarm || { echo "lidosd: could not re-enable sleep: $SLEEP_ERR (state left unchanged)" >&2; exit 1; } ;;
+    status)  status ;;
+    daemon)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "lidosd: 'daemon' runs as root under launchd; not meant to be run by hand" >&2
+            exit 1
+        fi
+        daemon ;;
+    *)       usage ;;
+esac
